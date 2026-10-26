@@ -1,0 +1,19 @@
+OK    cv2: 5.0.0
+OK    Pillow: 13.0.0
+OK    numpy: 2.5.4
+OK    scikit-image: 0.26.0
+OK    scipy: 1.18.1
+OK    PyWavelets: 1.8.0
+OK    wavelet denoise: (64, 64)
+OK    PyMuPDF: 2.0 (pymupdf)
+OK    pytesseract: imported
+OK    win32com (WIA): imported
+OK    icon: (64, 64)
+OK    enhance pipeline: (500, 700)
+OK    extras (blank/PDF tools): blank detection + PDF tools (2 pages)
+OK    enhance pipeline (B/W): (500, 700)
+OK    AI super-resolution model: ESPCN model loaded
+OK    invoice extraction (Excel export): invoice extraction + xlsx export
+OK    Tesseract engine: C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+OK    RapidOCR engine (optional): RapidOCR loaded
+RESULT: PASS
