@@ -2,15 +2,23 @@
 ; Installs the app, then silently installs the Tesseract OCR engine (if missing)
 ; and copies the Arabic / French / English language data. No Python needed on the client PC.
 
-#define AppName    "Canon Scan Pro"
-#define AppVersion "7.3.0"
-#define AppExe     "CanonScanPro.exe"
+#define AppName        "Canon Scan Pro"
+#define AppVersion     "7.3.0"
+#define AppExe         "CanonScanPro.exe"
+#define DeveloperName  "Abdessadok Chaouki"
+#define DeveloperEmail "abdessadokchaouki@gmail.com"
+#define DeveloperPhone "+213667574666"
 
 [Setup]
 AppId={{7D2C3A94-5B1E-4F7A-9A66-C0A0A5CA11F0}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher={#AppName}
+AppPublisher={#DeveloperName}
+AppPublisherURL=mailto:{#DeveloperEmail}
+AppSupportURL=mailto:{#DeveloperEmail}
+AppUpdatesURL=mailto:{#DeveloperEmail}
+AppContact={#DeveloperEmail} / WhatsApp {#DeveloperPhone}
+AppComments=Developer: {#DeveloperName} - Email: {#DeveloperEmail} - Phone/WhatsApp: {#DeveloperPhone}
 DefaultDirName={autopf}\Canon Scan Pro
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes

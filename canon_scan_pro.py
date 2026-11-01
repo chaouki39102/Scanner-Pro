@@ -14,10 +14,16 @@ import app_icon
 import extras
 import invoice_extract as ie
 import invoice_ui
+import scanner_backend as sb
 from ui_theme import T
 from tkinter import font as tkfont
 
 APP_NAME = "Canon Scan Pro"
+APP_VERSION = "7.3.0"
+DEVELOPER_NAME_AR = ui.DEVELOPER_NAME_AR
+DEVELOPER_NAME = ui.DEVELOPER_NAME
+DEVELOPER_PHONE = ui.DEVELOPER_PHONE
+DEVELOPER_EMAIL = ui.DEVELOPER_EMAIL
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "Pictures", "Canon Scans")
 os.makedirs(DEFAULT_DIR, exist_ok=True)
 
@@ -98,83 +104,11 @@ def _get_value(props, prop_id, default=None):
 
 
 def wia_scan(dpi=300, color=True):
-    """Acquire one FULL page through Windows WIA COM (A4 flatbed area)."""
-    try:
-        import win32com.client
-    except ImportError:
-        raise RuntimeError("مكتبة pywin32 غير مثبتة. شغّل install.bat ثم أعد فتح البرنامج.")
-    try:
-        dm = win32com.client.Dispatch("WIA.DeviceManager")
-        devices = []
-        for info in dm.DeviceInfos:
-            try:
-                name = str(info.Properties("Name").Value)
-            except Exception:
-                name = "Scanner"
-            devices.append((info, name))
-        if not devices:
-            raise RuntimeError("لم يعثر Windows على ماسح ضوئي عبر WIA. ثبّت تعريف Canon MF3010 وأعد تشغيل الجهاز.")
-        chosen = None
-        for info, name in devices:
-            if "MF3010" in name.upper() or "CANON" in name.upper():
-                chosen = info
-                break
-        if chosen is None:
-            chosen = devices[0][0]
-        device = chosen.Connect()
-        item = device.Items(1)
-        ip = item.Properties
-        dp = device.Properties
-        dpi = int(dpi)
-
-        # 1) Intent first (changing it can reset other values), then data type.
-        _set_prop(ip, 6146, 1 if color else 2)      # 1 = color, 2 = grayscale
-        _set_prop(ip, 4103, 3 if color else 2)      # 3 = color, 2 = grayscale
-
-        # 2) Resolution.
-        _set_prop(ip, 6147, dpi)
-        _set_prop(ip, 6148, dpi)
-
-        # 3) Scan area: start at (0,0) and cover the whole bed.
-        # Bed size is reported in 1/1000 inch; fall back to A4 if unavailable.
-        bed_w = _get_value(dp, 3074, None)           # Horizontal Bed Size
-        bed_h = _get_value(dp, 3075, None)           # Vertical Bed Size
-        try:
-            bed_w = int(bed_w) if bed_w else 8267
-            bed_h = int(bed_h) if bed_h else 11692
-        except Exception:
-            bed_w, bed_h = 8267, 11692
-        want_w = int(round(bed_w / 1000.0 * dpi))
-        want_h = int(round(bed_h / 1000.0 * dpi))
-
-        _set_prop(ip, 6149, 0)                       # Horizontal start
-        _set_prop(ip, 6150, 0)                       # Vertical start
-
-        # Clamp to what the driver allows at this DPI.
-        for pid, want in ((6151, want_w), (6152, want_h)):
-            p = _find_prop(ip, pid)
-            value = want
-            if p is not None:
-                try:
-                    mx = int(p.SubTypeMax)
-                    if mx > 0:
-                        value = min(want, mx)
-                except Exception:
-                    pass
-            _set_prop(ip, pid, value)
-
-        # Transfer as JPEG; fall back to the driver default format.
-        try:
-            image_file = item.Transfer("{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}")
-        except Exception:
-            image_file = item.Transfer()
-        path = os.path.join(tempfile.gettempdir(), "canon_scan_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg")
-        image_file.SaveFile(path)
-        return _normalize_scan_file(path)
-    except Exception as e:
-        raise RuntimeError("تعذر تنفيذ المسح عبر WIA.\n"
-            "تأكد من تشغيل الطابعة وتثبيت تعريف Canon MF3010، ثم جرّب تطبيق Windows Scan.\n"
-            "تفاصيل النظام: " + str(e))
+    """Acquire one full page through the WIA backend (COM-safe)."""
+    paths = sb.scan(sb.ScanOptions(dpi=dpi, color=color, driver="wia", source="flatbed"))
+    if not paths:
+        raise RuntimeError("لم يُعد الماسح الضوئي أي صورة.")
+    return _normalize_scan_file(paths[0])
 
 
 def _normalize_scan_file(path):
@@ -249,30 +183,267 @@ class Logo(tk.Canvas):
         self.create_image(0, 0, image=self._a, anchor="nw")
 
 
-class EmptyState(tk.Canvas):
-    """بطاقة الترحيب عند عدم وجود صفحات."""
-    W, H = 500, 320
+class SessionsBrowser(tk.Frame):
+    """جلسات محفوظة: بحث وتصفية وفرز وتمرير وتثبيت وتبديل — مشتركة بين الواجهة الأولى والنافذة المنبثقة."""
 
-    def __init__(self, master, on_scan, on_open):
-        super().__init__(master, width=self.W, height=self.H, highlightthickness=0, bd=0)
-        self.b1 = ui.Btn(self, "بدء المسح الضوئي", on_scan, icon="scan", variant="primary", height=44, bg_token="surface")
-        self.b2 = ui.Btn(self, "فتح صورة", on_open, icon="image", height=44, bg_token="surface")
-        ui.register(self); self.retheme()
+    def __init__(self, master, app, compact=False, show_title=True, bg_token="surface",
+                 on_open=None, on_previous=None, on_close=None, initial=None):
+        super().__init__(master, bg=T[bg_token], bd=0, highlightthickness=0)
+        self.app = app; self.compact = compact; self.show_title = show_title; self.bg_token = bg_token
+        self.on_open = on_open; self.on_previous = on_previous; self.on_close = on_close
+        self.sessions = []; self._initial = list(initial) if initial is not None else None
+        self.sel = None; self.items = []; self.cards = {}; self._thumbs = []
+        self.qv = tk.StringVar(); self.sortv = tk.StringVar(value="new"); self.viewv = tk.StringVar(value="all")
+        self._build(); ui.register(self); self.refresh()
+
+    def _build(self):
+        bg = self.bg_token
+        hrow = ui.Themed(self, bg); hrow.pack(fill="x")
+        if self.show_title:
+            ui.label(hrow, "الجلسات السابقة", "body_b" if self.compact else "h3", "fg", bg, anchor="e").pack(side="right")
+        self.count_lbl = ui.label(hrow, "", "small", "muted", bg, anchor="e")
+        self.count_lbl.pack(side="right", padx=(10, 0))
+        ui.Btn(hrow, "تحديث", self.refresh, icon="redo", height=30, pad=8, font="small_b",
+               fill_x=False, bg_token=bg, tip="إعادة قراءة الجلسات من القرص").pack(side="left")
+        fbar = ui.Themed(self, bg); fbar.pack(fill="x", pady=(8, 3))
+        ui.label(fbar, "بحث", "small", "fg2", bg, anchor="e").pack(side="right")
+        self.field = ui.Field(fbar, self.qv, justify="right")
+        self.field.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        view = ui.Segmented(fbar, [("all", "الكل"), ("pinned", "المثبتة")], self.viewv,
+                            command=lambda _v: self._render(), height=30, bg_token=bg, font="small")
+        view.configure(width=150 if self.compact else 170); view.pack(side="left", padx=(8, 0))
+        sbar = ui.Themed(self, bg); sbar.pack(fill="x", pady=(0, 3))
+        ui.label(sbar, "ترتيب", "small", "fg2", bg, anchor="e").pack(side="right")
+        sort = ui.Segmented(sbar, [("new", "الأحدث"), ("old", "الأقدم"), ("pages", "الأكثر صفحات")], self.sortv,
+                            command=lambda _v: self._render(), height=30, bg_token=bg, font="small")
+        sort.configure(width=300 if self.compact else 350); sort.pack(side="right", padx=(8, 0))
+        area = ui.Themed(self, bg); area.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(area, bg=T[bg], highlightthickness=0, bd=0)
+        vsb = ttk.Scrollbar(area, orient="vertical", style="Slim.Vertical.TScrollbar", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="left", fill="y"); self.canvas.pack(side="right", fill="both", expand=True)
+        self.host = ui.Themed(self.canvas, bg)
+        self.host_id = self.canvas.create_window((0, 0), window=self.host, anchor="nw")
+        self.host.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.host_id, width=e.width))
+        self.canvas.bind("<MouseWheel>", self._wheel); self.host.bind("<MouseWheel>", self._wheel)
+        foot = ui.Themed(self, bg); foot.pack(fill="x", pady=(6, 0), before=area)
+        frow = ui.Themed(foot, bg); frow.pack(fill="x")
+        hh = 36 if self.compact else 40
+        self.btn_open = ui.Btn(frow, "فتح / تبديل", self.open_selected, icon="layers", variant="primary",
+                               height=hh, fill_x=False, bg_token=bg)
+        self.btn_open.pack(side="right")
+        self.btn_del = ui.Btn(frow, "حذف", self.delete_selected, icon="trash", variant="danger",
+                              height=hh, fill_x=False, bg_token=bg)
+        self.btn_del.pack(side="right", padx=(6, 0))
+        self.btn_pin = ui.Btn(frow, "تثبيت", self.pin_selected, icon="doc", height=hh, fill_x=False, bg_token=bg)
+        self.btn_pin.pack(side="right", padx=(6, 0))
+        ui.Btn(frow, "العودة للسابقة", self.previous_session, icon="undo",
+               height=hh, fill_x=False, bg_token=bg).pack(side="left")
+        if self.on_close:
+            ui.Btn(frow, "إغلاق", self.on_close, height=hh, fill_x=False, bg_token=bg).pack(side="left", padx=(6, 0))
+        self.qv.trace_add("write", lambda *a: self._render())
 
     def retheme(self):
-        self.delete("all"); self.configure(bg=T["canvas"])
-        W, H = self.W, self.H
-        self._bg = ui.rr_image(W, H, 20, T["surface"], T["border"])
-        self._ring = ui.rr_image(88, 88, 44, T["accent_soft"])
-        self._ic = ui.icon_image("scan", 44, T["accent"])
+        self.configure(bg=T[self.bg_token])
+        if self.winfo_exists(): self._render()
+
+    def refresh(self):
+        if self._initial is not None:
+            self.sessions, self._initial = self._initial, None
+        else:
+            try: self.sessions = self.app._list_saved_sessions(thumbs=1000)
+            except Exception: self.sessions = []; traceback.print_exc()
+        if self.sel and not any(s.get("path") == self.sel for s in self.sessions): self.sel = None
+        self._render()
+
+    def _filtered(self):
+        q = self.qv.get().strip().lower(); only = self.viewv.get() == "pinned"; out = []
+        for s in self.sessions:
+            if only and not s.get("pinned"): continue
+            hay = f"{s.get('when','')} {s.get('count',0)} صفحة {'مثبتة' if s.get('pinned') else ''} {s.get('name','')}".lower()
+            if q and q not in hay: continue
+            out.append(s)
+        if self.sortv.get() == "old": out.sort(key=lambda s: s.get("name", ""))
+        elif self.sortv.get() == "pages": out.sort(key=lambda s: s.get("count", 0), reverse=True)
+        else: out.sort(key=lambda s: s.get("name", ""), reverse=True)
+        out.sort(key=lambda s: not s.get("pinned"))
+        return out
+
+    def _selected(self):
+        for s in self.sessions:
+            if s.get("path") == self.sel: return s
+        return None
+
+    def _update_buttons(self):
+        s = self._selected()
+        for b in (self.btn_open, self.btn_del, self.btn_pin):
+            try: b.set_state("normal" if s else "disabled")
+            except Exception: pass
+        try: self.btn_pin.set_text("إلغاء التثبيت" if s and s.get("pinned") else "تثبيت")
+        except Exception: pass
+
+    def _highlight(self):
+        for p, card in self.cards.items():
+            card.configure(highlightbackground=T["accent"] if p == self.sel else T["border"])
+
+    def select(self, path):
+        self.sel = path; self._highlight(); self._update_buttons()
+
+    def _bind_wheel(self, w):
+        w.bind("<MouseWheel>", self._wheel)
+        for ch in w.winfo_children(): self._bind_wheel(ch)
+
+    def _wheel(self, e):
+        self.canvas.yview_scroll(int(-e.delta / 120), "units"); return "break"
+
+    def _make_row(self, s):
+        card = tk.Frame(self.host, bg=T["surface"], highlightthickness=2,
+                        highlightbackground=T["border"], bd=0, cursor="hand2")
+        card.pack(fill="x", padx=4, pady=3)
+        self.cards[s["path"]] = card
+        star = tk.Label(card, text="★" if s.get("pinned") else "☆", bg=T["surface"],
+                        fg=T["warn"] if s.get("pinned") else T["muted"], font=ui.F("h3"), cursor="hand2", padx=6)
+        star.pack(side="left")
+        star.bind("<Button-1>", lambda e, ss=s: self._toggle_pin(ss))
+        thumb = s.get("thumb"); tw, th = (86, 62) if self.compact else (120, 86)
+        if thumb is not None:
+            im = thumb.copy(); im.thumbnail((tw, th))
+            ph = ImageTk.PhotoImage(im); self._thumbs.append(ph)
+            tl = tk.Label(card, image=ph, bg=T["surface2"], bd=0)
+        else:
+            tl = tk.Label(card, text="لا معاينة", bg=T["surface2"], fg=T["muted"], font=ui.F("small"),
+                          width=10 if self.compact else 14, height=3 if self.compact else 4)
+        tl.pack(side="right", padx=8, pady=8)
+        txt = tk.Frame(card, bg=T["surface"]); txt.pack(side="right", fill="both", expand=True, pady=8)
+        title = tk.Label(txt, text=f"جلسة {s.get('when') or '—'}", bg=T["surface"], fg=T["fg"],
+                         font=ui.F("small_b" if self.compact else "h3"), anchor="e")
+        title.pack(fill="x")
+        meta = f"{s.get('count',0)} صفحة" + ("   •   مثبتة" if s.get("pinned") else "")
+        sub = tk.Label(txt, text=meta, bg=T["surface"], fg=T["fg2"], font=ui.F("small"), anchor="e")
+        sub.pack(fill="x")
+        for wdg in (card, txt, title, sub, tl):
+            wdg.bind("<Button-1>", lambda e, ss=s: self.select(ss["path"]))
+            wdg.bind("<Double-Button-1>", lambda e, ss=s: self._open(ss))
+        self._bind_wheel(card)
+
+    def _open(self, s=None):
+        s = s or self._selected()
+        if not s: return
+        if self.on_open: self.on_open(s)
+        else: self.app._load_session_from_path(s["path"])
+
+    def open_selected(self): self._open()
+
+    def _delete(self, s=None):
+        s = s or self._selected()
+        if not s: return
+        if not messagebox.askyesno("حذف الجلسة", "هل تريد حذف هذه الجلسة المحفوظة نهائيًا؟",
+                                   parent=self.winfo_toplevel()): return
+        if not self.app._remove_archive_dir(s["dir"]):
+            messagebox.showerror("خطأ", "تعذّر حذف الجلسة.", parent=self.winfo_toplevel()); return
+        self.sessions = [x for x in self.sessions if x.get("path") != s["path"]]
+        if self.sel == s["path"]: self.sel = None
+        if not self.app.pages:
+            try: self.app.show_page()
+            except Exception: pass
+        if self.winfo_exists(): self._render()
+
+    def delete_selected(self): self._delete()
+
+    def _toggle_pin(self, s=None):
+        s = s or self._selected()
+        if not s: return "break"
+        s["pinned"] = self.app._toggle_session_pin(s["dir"])
+        self._render()
+        return "break"
+
+    def pin_selected(self): self._toggle_pin()
+
+    def previous_session(self):
+        if self.on_previous: self.on_previous(); return
+        if not self.app._previous_session_path():
+            messagebox.showinfo("الجلسات السابقة", "لا توجد جلسة سابقة يمكن الرجوع إليها.",
+                                parent=self.winfo_toplevel()); return
+        self.app.switch_to_previous_session()
+
+    def move_selection(self, delta):
+        if self.focus_get() is self.field.entry: return "break"
+        if not self.items: return
+        paths = [s["path"] for s in self.items]
+        i = paths.index(self.sel) if self.sel in paths else -1
+        i = max(0, min(len(self.items) - 1, i + delta))
+        self.sel = paths[i]; self._highlight(); self._update_buttons()
+        card = self.cards.get(paths[i])
+        if card is not None:
+            try:
+                self.canvas.update_idletasks()
+                self.canvas.yview_moveto(max(0.0, min(1.0, card.winfo_y() / max(1, self.host.winfo_height()))))
+            except Exception: pass
+        return "break"
+
+    def _render(self):
+        if not self.winfo_exists(): return
+        for wdg in self.host.winfo_children(): wdg.destroy()
+        self.cards.clear(); self._thumbs.clear()
+        items = self._filtered(); self.items = items
+        if self.sel and not any(s.get("path") == self.sel for s in items): self.sel = None
+        if items and self.sel is None: self.sel = items[0]["path"]
+        if not items:
+            tk.Label(self.host, text="لا توجد جلسات مطابقة للبحث أو التصفية.",
+                     bg=T[self.bg_token], fg=T["muted"], font=ui.F("body")).pack(fill="x", pady=24)
+        else:
+            for s in items: self._make_row(s)
+        self._highlight(); self._update_buttons()
+        self.count_lbl.configure(text=f"{len(items)} من {len(self.sessions)} جلسة")
+        try: self.canvas.yview_moveto(0)
+        except Exception: pass
+
+
+class EmptyState(tk.Canvas):
+    """بطاقة الترحيب عند عدم وجود صفحات، مع قائمة الجلسات المحسّنة."""
+
+    def __init__(self, master, app):
+        super().__init__(master, highlightthickness=0, bd=0)
+        self.app = app
+        self._cw = self._ch = 0
+        self.b1 = ui.Btn(self, "بدء المسح الضوئي", app.scan, icon="scan", variant="primary",
+                         height=42, bg_token="surface", fill_x=False)
+        self.b2 = ui.Btn(self, "فتح صورة", app.open_image, icon="image",
+                         height=42, bg_token="surface", fill_x=False)
+        self.b3 = ui.Btn(self, "مدير الجلسات", app.load_saved_session, icon="layers",
+                         height=42, bg_token="surface", fill_x=False)
+        self.browser = SessionsBrowser(self, app, compact=True, show_title=True, bg_token="surface")
+        ui.register(self)
+        self.resize(760, 420)
+
+    def retheme(self):
+        self.resize(self._cw, self._ch, force=True)
+
+    def resize(self, w, h, force=False):
+        w = max(560, int(w)); h = max(380, int(h))
+        if not force and (w, h) == (self._cw, self._ch): return
+        self._cw, self._ch = w, h
+        self.configure(width=w, height=h)
+        self.delete("all")
+        self._bg = ui.rr_image(w, h, 20, T["surface"], T["border"])
         self.create_image(0, 0, image=self._bg, anchor="nw")
-        self.create_image(W // 2 - 44, 34, image=self._ring, anchor="nw")
-        self.create_image(W // 2, 78, image=self._ic)
-        self.create_text(W // 2, 148, text="ابدأ بمسح مستند", fill=T["fg"], font=ui.F("h2"))
-        self.create_text(W // 2, 178, anchor="n", width=420, justify="center", fill=T["fg2"], font=ui.F("body"),
-                         text="ضع الورقة على زجاج الماسح ثم اضغط «بدء المسح الضوئي»،\nأو افتح صورة جاهزة لتحسينها وتصديرها.")
-        self.create_window(W - 34, 262, window=self.b1, width=220, height=44, anchor="e")
-        self.create_window(W - 34 - 220 - 12, 262, window=self.b2, width=200, height=44, anchor="e")
+        compact_h = h < 500
+        self.create_text(w - 26, 20, text="ابدأ بمسح مستند", anchor="ne", fill=T["fg"], font=ui.F("h2"))
+        if not compact_h:
+            self.create_text(w - 26, 48, anchor="ne", width=min(660, w - 52), justify="right", fill=T["fg2"],
+                             font=ui.F("body"),
+                             text="ضع الورقة على زجاج الماسح ثم اضغط «بدء المسح الضوئي»، أو افتح صورة، أو تابع جلسة سابقة.")
+        by = 60 if compact_h else 84
+        x = w - 24
+        self.create_window(x, by, window=self.b1, width=200, height=42, anchor="ne"); x -= 208
+        self.create_window(x, by, window=self.b2, width=150, height=42, anchor="ne"); x -= 158
+        self.create_window(x, by, window=self.b3, width=170, height=42, anchor="ne")
+        sep = by + 56
+        self.create_line(24, sep, w - 24, sep, fill=T["border"])
+        top = sep + 10
+        self.create_window(24, top, window=self.browser, width=w - 48,
+                           height=max(160, h - top - 14), anchor="nw")
 
 class App(tk.Tk):
     # >>> __init__
@@ -293,8 +464,14 @@ class App(tk.Tk):
         self.filter_name=tk.StringVar(value="ألوان طبيعية محسّنة")
         self.preset=tk.StringVar(value="صورة ملونة")
         self.scan_color=tk.BooleanVar(value=False)
+        self.scan_driver=tk.StringVar(value="auto")
+        self.scan_source=tk.StringVar(value="flatbed")
+        self.scan_device=tk.StringVar(value="")
         self.mode_hint=tk.StringVar(value="")
         self._restoring=False
+        self._session_loaded=False
+        self._session_error=None
+        self._current_session_path=None
         self.opt_crop=tk.BooleanVar(value=True)
         self.opt_deskew=tk.BooleanVar(value=True)
         self.opt_shadows=tk.BooleanVar(value=True)
@@ -332,6 +509,12 @@ class App(tk.Tk):
         self.status=tk.StringVar(value="جاهز — ضع الورقة على زجاج Canon MF3010 ثم ابدأ المسح.")
         self._photo=None
         self._refs=[]
+        self._scanner_devices=[]
+        self._device_choice=None
+        self._device_box=None
+        self._scan_refreshing=False
+        self._diag_running=False
+        self._saved_scan_device=""
         self._resize_job=None
         self._canvas_img_rect=None
         self._crop_start=None
@@ -357,18 +540,26 @@ class App(tk.Tk):
         os.makedirs(self._session_dir, exist_ok=True)
         prefs=self._load_prefs()
         ui.set_theme(prefs.get("theme","light"))
+        saved_driver=str(prefs.get("scan_driver","auto") or "auto")
+        self.scan_driver.set(saved_driver if saved_driver in ("auto","wia","twain") else "auto")
+        saved_source=str(prefs.get("scan_source","flatbed") or "flatbed")
+        self.scan_source.set(saved_source if saved_source in ("flatbed","adf","duplex") else "flatbed")
+        self._saved_scan_device=str(prefs.get("scan_device_id","") or "")
+        self.scan_device.set(self._saved_scan_device)
         self.dark_mode=tk.BooleanVar(value=ui.THEME_NAME=="dark")
         ui.init_fonts(self)
         self.configure(bg=T["bg"])
         self._style_scrollbar()
         self._build_ui()
         self._drain_ui_queue()
-        self._restore_session()
+        self._startup_session()
+        self.after(600, lambda: self.refresh_scanners(True))
         # Keyboard shortcuts. RTL: left arrow = next page, right arrow = previous page.
         self.bind("<Control-o>", lambda _e: self.open_image())
         self.bind("<Control-s>", lambda _e: self.save_image())
         self.bind("<Control-Shift-S>", lambda _e: self.save_pdf())
         self.bind("<Control-n>", lambda _e: self.new_session())
+        self.bind("<Control-r>", lambda _e: self.load_saved_session())
         self.bind("<Control-z>", lambda _e: self.undo())
         self.bind("<Control-i>", lambda _e: self.extract_invoices())
         self.bind("<Control-y>", lambda _e: self.redo())
@@ -386,6 +577,9 @@ class App(tk.Tk):
         self.pdf_page.trace_add("write", lambda *a: self._schedule_estimate())
         self.filter_name.trace_add("write", lambda *a: self._update_mode_hint())
         self.scan_color.trace_add("write", lambda *a: self._update_mode_hint())
+        self.scan_driver.trace_add("write", lambda *a: self._scan_driver_changed())
+        self.scan_source.trace_add("write", lambda *a: self._save_prefs())
+        self.scan_device.trace_add("write", lambda *a: self._save_prefs())
         self._update_mode_hint()
 
     # >>> _mode_hint
@@ -414,6 +608,9 @@ class App(tk.Tk):
     def _save_prefs(self):
         try:
             data=self._load_prefs(); data["theme"]=ui.THEME_NAME
+            data["scan_driver"]=self.scan_driver.get()
+            data["scan_source"]=self.scan_source.get()
+            data["scan_device_id"]=self.scan_device.get()
             with open(os.path.join(self._session_dir,"prefs.json"),"w",encoding="utf-8") as f:
                 json.dump(data,f,ensure_ascii=False)
         except Exception:pass
@@ -437,6 +634,7 @@ class App(tk.Tk):
 
     # >>> _build_ui
     def _build_ui(self):
+        self._thumbs = []
         self._build_header()
         self._build_statusbar()
         body=ui.Themed(self,"bg"); body.pack(fill="both",expand=True)
@@ -457,15 +655,43 @@ class App(tk.Tk):
         self.btn_redo=ui.IconBtn(inner,"redo",self.redo,tip="إعادة (Ctrl+Y)",bg_token="surface"); self.btn_redo.pack(side="left",padx=2)
         self.btn_undo=ui.IconBtn(inner,"undo",self.undo,tip="تراجع (Ctrl+Z)",bg_token="surface"); self.btn_undo.pack(side="left",padx=2)
         ui.Btn(inner,"جلسة جديدة",self.new_session,icon="clear",height=36,pad=10,
+               variant="soft",
                tip="بدء جلسة جديدة وإزالة كل الصفحات (Ctrl+N)").pack(side="left",padx=(8,0))
+        ui.Btn(inner,"إغلاق الجلسة",self.close_session,icon="clear",height=36,pad=10,
+               variant="soft",
+               tip="إغلاق الجلسة الحالية وحذف جميع الصفحات").pack(side="left",padx=(8,0))
+        ui.Btn(inner,"الجلسات",self.load_saved_session,icon="layers",height=36,pad=10,
+               variant="soft",
+               tip="الجلسات السابقة: بحث، تصفية، تثبيت، فتح وتبديل (Ctrl+R)").pack(side="left",padx=(8,0))
         ui.HSep(hdr).pack(fill="x")
 
     def _build_statusbar(self):
         sb=ui.Themed(self,"surface"); sb.pack(fill="x",side="bottom")
         ui.HSep(sb).pack(fill="x")
         row=ui.Themed(sb,"surface"); row.pack(fill="x",padx=20,pady=6)
-        ui.label(row,"Ctrl+N جلسة جديدة   •   Ctrl+O فتح   •   Ctrl+S حفظ   •   Ctrl+Z تراجع   •   عجلة الفأرة للتكبير   •   زر الفأرة الأيمن للتحريك","small","muted","surface",anchor="w").pack(side="left")
+        ui.label(row,"Ctrl+N جلسة جديدة   •   Ctrl+R الجلسات   •   Ctrl+O فتح   •   Ctrl+S حفظ   •   Ctrl+Z تراجع   •   عجلة الفأرة للتكبير   •   زر الفأرة الأيمن للتحريك","small","muted","surface",anchor="w").pack(side="left")
         ui.label(row,"","small","fg2","surface",anchor="e",textvariable=self.status).pack(side="right",fill="x")
+        ui.HSep(sb).pack(fill="x")
+        dev=ui.Themed(sb,"surface2"); dev.pack(fill="x",side="bottom")
+        drow=ui.Themed(dev,"surface2"); drow.pack(fill="x",padx=20,pady=5)
+        ui.label(drow,f"المطوّر: {DEVELOPER_NAME_AR} — {DEVELOPER_NAME}","small_b","fg","surface2",anchor="e").pack(side="right")
+        ui.label(drow,f"الهاتف/واتساب: {DEVELOPER_PHONE}","small","fg2","surface2",anchor="e").pack(side="right",padx=(18,0))
+        ui.label(drow,f"البريد: {DEVELOPER_EMAIL}","small","fg2","surface2",anchor="e").pack(side="right",padx=(18,0))
+        ui.Btn(drow,"معلومات المطوّر",self.show_about,icon="doc",height=30,pad=10,font="small_b",
+               variant="soft",bg_token="surface2",tip="عرض بيانات المطوّر ووسائل التواصل").pack(side="left")
+        ui.Btn(drow,"نسخ البيانات",self._copy_developer_line,icon="layers",height=30,pad=10,font="small_b",
+               variant="ghost",bg_token="surface2",tip="نسخ بيانات التواصل إلى الحافظة").pack(side="left",padx=(8,0))
+
+    def _copy_developer_line(self):
+        line=f"{DEVELOPER_NAME_AR} — {DEVELOPER_NAME} | {DEVELOPER_PHONE} | {DEVELOPER_EMAIL}"
+        try:
+            self.clipboard_clear(); self.clipboard_append(line)
+            self.status.set("تم نسخ بيانات المطوّر إلى الحافظة.")
+        except Exception:
+            pass
+
+    def show_about(self):
+        ui.show_developer_info(self, APP_NAME, APP_VERSION)
 
     # ------------------------------------------------------------ اللوحة اليمنى
     def _build_sidebar(self,body):
@@ -480,7 +706,7 @@ class App(tk.Tk):
         self.btn_scan=ui.Btn(pad,"بدء المسح الضوئي",self.scan,icon="scan",variant="primary",height=48)
         self.btn_scan.pack(fill="x")
         row=ui.Themed(pad,"surface"); row.pack(fill="x",pady=(8,0))
-        ui.Btn(row,"تصدير كصورة",self.export_image,icon="export",height=38,pad=8,font="small_b",tip="تصدير الصفحة الحالية كصورة بالصيغة المختارة في تبويب التصدير (Ctrl+S)").pack(side="right",expand=True,fill="x",padx=(0,3))
+        ui.Btn(row,"جلسة جديدة",self.new_session,icon="clear",height=38,pad=8,font="small_b",variant="soft",tip="بدء جلسة جديدة وإزالة كل الصفحات (Ctrl+N)").pack(side="right",expand=True,fill="x",padx=(0,3))
         ui.Btn(row,"فتح صورة",self.open_image,icon="image",height=38,pad=8,font="small_b",tip="فتح صورة كصفحة جديدة (Ctrl+O)").pack(side="right",expand=True,fill="x",padx=3)
         ui.Btn(row,"تصدير PDF",self.save_pdf,icon="pdf",height=38,pad=8,font="small_b",tip="تصدير كل الصفحات إلى PDF (Ctrl+Shift+S)").pack(side="right",expand=True,fill="x",padx=(3,0))
         self.progress=ui.Progress(pad); self.progress.pack(fill="x",pady=(12,0))
@@ -517,7 +743,19 @@ class App(tk.Tk):
         r=ui.Themed(parent,"surface"); r.pack(fill="x",pady=pady); return r
 
     def _tab_scan(self,p):
-        b=self._card(p,"المسح الضوئي","scan",True)
+        b=self._card(p,"الماسح الضوئي","scan",True)
+        ui.label(b,"برنامج تشغيل الماسح","small","fg2").pack(fill="x")
+        ui.Segmented(b,[("auto","تلقائي"),("wia","WIA"),("twain","TWAIN")],self.scan_driver).pack(fill="x",pady=(6,12))
+        ui.label(b,"الماسح المكتشف","small","fg2").pack(fill="x")
+        self._device_box=ui.Themed(b,"surface"); self._device_box.pack(fill="x",pady=(6,0))
+        self._render_scanner_choices()
+        r=self._row(b,(8,0))
+        ui.Btn(r,"تحديث القائمة",lambda:self.refresh_scanners(False),icon="redo",height=36,pad=8,font="small_b").pack(side="right",expand=True,fill="x",padx=(0,4))
+        ui.Btn(r,"تشخيص الماسح",self.show_scanner_diagnostics,icon="doc",height=36,pad=8,font="small_b").pack(side="right",expand=True,fill="x",padx=(4,0))
+        ui.label(b,"مصدر الورق","small","fg2").pack(fill="x",pady=(10,0))
+        ui.Segmented(b,[("flatbed","زجاج المسح"),("adf","درج التغذية"),("duplex","درج + وجهين")],self.scan_source).pack(fill="x",pady=(6,0))
+        ui.label(b,"يُختار آخر جهاز محفوظ تلقائيًا، وإذا وُجد جهاز واحد فقط فلا حاجة لاختياره. زر التشخيص يحفظ تقريرًا يوضح سبب عدم ظهور الماسح.","small","muted",wraplength=320).pack(fill="x",pady=(8,0))
+        b=self._card(p,"المسح الضوئي","scan")
         ui.label(b,"دقة المسح (DPI)","small","fg2").pack(fill="x")
         ui.Segmented(b,[(v,str(v)) for v in (150,200,300,400,600)],self.dpi).pack(fill="x",pady=(6,14))
         ui.label(b,"نوع التحسين الأساسي","small","fg2").pack(fill="x")
@@ -537,7 +775,121 @@ class App(tk.Tk):
             self._chips.append(ch)
         self.preset.trace_add("write",lambda *a:[c._draw() for c in self._chips])
 
+    def _render_scanner_choices(self):
+        box=self._device_box
+        if box is None:
+            return
+        for child in list(box.winfo_children()):
+            child.destroy()
+        self._device_choice=None
+        devices=list(self._scanner_devices)
+        if not devices:
+            ui.label(box,"لم يتم العثور على ماسح بعد. اضغط «تحديث القائمة».","small","muted",wraplength=320).pack(fill="x",pady=6)
+            return
+        keys={d.key for d in devices}
+        if self.scan_device.get() not in keys:
+            self.scan_device.set(self._pick_default_device(devices).key)
+        options=[(d.key,d.display_name) for d in devices]
+        self._device_choice=ui.Choice(box,options,self.scan_device,command=self._on_device_selected)
+        self._device_choice.pack(fill="x")
+
+    def _pick_default_device(self,devices):
+        saved=self._saved_scan_device or self.scan_device.get()
+        for device in devices:
+            if device.key==saved or device.device_id==saved:
+                return device
+        return devices[0]
+
+    def _on_device_selected(self,key):
+        self._saved_scan_device=key
+        self._save_prefs()
+
+    def _scan_driver_changed(self):
+        self._saved_scan_device=""
+        self.scan_device.set("")
+        self._save_prefs()
+        self.refresh_scanners(False)
+
+    def refresh_scanners(self,silent=False):
+        if self._scan_refreshing:
+            return
+        self._scan_refreshing=True
+        driver=self.scan_driver.get()
+        hwnd=self.winfo_id()
+        if not silent:
+            self.status.set("جارٍ البحث عن الماسحات الضوئية…")
+        def worker():
+            devices=[]; error=""
+            try:
+                devices=sb.list_devices(driver,parent_hwnd=hwnd)
+            except Exception as e:
+                error=str(e)
+                sb.log.warning("Scanner discovery failed: %s",e)
+            self._post_ui(lambda: self._scanners_loaded(devices,error,silent))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def _scanners_loaded(self,devices,error,silent):
+        self._scan_refreshing=False
+        self._scanner_devices=list(devices)
+        self._render_scanner_choices()
+        if devices:
+            selected=self._pick_default_device(devices)
+            self.status.set("الماسح الجاهز: "+selected.display_name)
+            return
+        self.status.set("لم يُعثر على ماسح ضوئي — اضغط «تحديث القائمة» أو «تشخيص الماسح».")
+        if silent:
+            return
+        msg=error or "لم يعثر Windows على ماسح ضوئي جاهز."
+        if messagebox.askyesno("Canon Scan Pro",msg+"\n\nهل تريد فتح تقرير التشخيص الآن؟"):
+            self.show_scanner_diagnostics()
+
+    def show_scanner_diagnostics(self):
+        if self._diag_running:
+            return
+        self._diag_running=True
+        driver=self.scan_driver.get()
+        hwnd=self.winfo_id()
+        self.status.set("جارٍ إنشاء تقرير تشخيص الماسح…")
+        def worker():
+            try:
+                report=sb.build_diagnostics(driver,parent_hwnd=hwnd)
+            except Exception as e:
+                report="تعذر إنشاء تقرير التشخيص:\n"+str(e)
+            self._post_ui(lambda: self._show_diagnostics_window(report))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def _show_diagnostics_window(self,report):
+        self._diag_running=False
+        win=tk.Toplevel(self)
+        win.title("تشخيص الماسح الضوئي — Canon Scan Pro")
+        win.geometry("760x560")
+        win.configure(bg=T["bg"])
+        bar=ui.Themed(win,"surface"); bar.pack(fill="x")
+        ui.HSep(bar).pack(side="bottom",fill="x")
+        row=ui.Themed(bar,"surface"); row.pack(fill="x",padx=14,pady=10)
+        ui.Btn(row,"إغلاق",win.destroy,icon="clear",height=34,pad=10,font="small_b").pack(side="right")
+        ui.Btn(row,"نسخ التقرير",lambda:self._copy_diagnostics(report),icon="layers",height=34,pad=10,font="small_b").pack(side="right",padx=(0,8))
+        body=ui.Themed(win,"bg"); body.pack(fill="both",expand=True,padx=14,pady=12)
+        scroll=ttk.Scrollbar(body,orient="vertical",style="Slim.Vertical.TScrollbar")
+        scroll.pack(side="left",fill="y")
+        text=tk.Text(body,wrap="word",bg=T["surface2"],fg=T["fg"],insertbackground=T["fg"],
+                     relief="flat",bd=0,highlightthickness=0,font=ui.F("small"),padx=12,pady=10,
+                     yscrollcommand=scroll.set)
+        text.pack(side="right",fill="both",expand=True)
+        scroll.configure(command=text.yview)
+        text.insert("1.0",report)
+        text.configure(state="disabled")
+        win.transient(self)
+
+    def _copy_diagnostics(self,report):
+        try:
+            self.clipboard_clear(); self.clipboard_append(report)
+            self.status.set("تم نسخ تقرير التشخيص إلى الحافظة.")
+        except Exception:
+            pass
+
     def _choose_preset(self,name):
+        if self.working:return
         self.preset.set(name); self.apply_preset()
 
     def _tab_enhance(self,p):
@@ -651,6 +1003,8 @@ class App(tk.Tk):
         ui.Switch(b,"استخدام أول سطر من النص (OCR)",self.name_ocr,sub="يحتاج Tesseract").pack(fill="x")
         b=self._card(p,"استيراد","pdf")
         ui.Btn(b,"فتح PDF كصفحات للتحرير",self.import_pdf,icon="pdf",height=40).pack(fill="x")
+        ui.Btn(b,"فتح جلسة سابقة",self.load_saved_session,icon="layers",height=40).pack(fill="x",pady=(8,0))
+        ui.Btn(b,"حفظ الجلسة الآن",self.save_session_manual,icon="export",height=40).pack(fill="x",pady=(8,0))
         b=self._card(p,"أدوات PDF (ملفات خارجية)","layers")
         for a,bb in ((("دمج ملفات PDF",self.tool_merge,"layers"),("تقسيم PDF",self.tool_split,"crop")),
                      (("استخراج صفحات",self.tool_extract,"export"),("حذف صفحات",self.tool_delete,"trash")),
@@ -694,7 +1048,7 @@ class App(tk.Tk):
         # لوحة المعاينة
         self.canvas=tk.Canvas(work,bg=T["canvas"],highlightthickness=1,highlightbackground=T["border"],highlightcolor=T["border"],bd=0,cursor="arrow")
         self.canvas.pack(fill="both",expand=True)
-        self.empty=EmptyState(self.canvas,self.scan,self.open_image)
+        self.empty=None
         self.canvas.bind("<Configure>",self._on_resize)
         self.canvas.bind("<ButtonPress-1>",self._crop_press)
         self.canvas.bind("<B1-Motion>",self._crop_drag)
@@ -702,6 +1056,10 @@ class App(tk.Tk):
         self.canvas.bind("<ButtonPress-3>",self._pan_start)
         self.canvas.bind("<B3-Motion>",self._pan_move)
         self.canvas.bind("<ButtonRelease-3>",lambda _e:setattr(self,"_pan_ref",None))
+        self.canvas.bind("<Motion>",self._edge_crop_motion)
+        self._edge_crop_drag=None
+        self._edge_crop_dir=None
+        self._edge_crop_rect=None
         self._layout_thumbs()
 
     def _post_ui(self,callback):
@@ -728,6 +1086,9 @@ class App(tk.Tk):
                 try:self.after_cancel(job)
                 except Exception:pass
                 setattr(self,attr,None)
+        try:
+            if not getattr(self,"_restoring",False):self._save_session()      # حفظ أخير قبل الإغلاق
+        except Exception:pass
         self.destroy()
 
     # >>> _set_busy
@@ -800,6 +1161,20 @@ class App(tk.Tk):
         cw=max(200,c.winfo_width()); ch=max(200,c.winfo_height())
         if not self.pages:
             self.strip.pack_forget()
+            reuse = self.empty is not None
+            if reuse:
+                try:
+                    reuse = self.empty.winfo_exists() and self.empty.winfo_ismapped()
+                except Exception:
+                    reuse = False
+            if not reuse:
+                try:
+                    self.empty.destroy()
+                except Exception:
+                    pass
+                self.empty = EmptyState(self.canvas, self)
+            ew = min(940, max(560, cw - 28)); eh = min(620, max(380, ch - 28))
+            self.empty.resize(ew, eh)
             self.empty.place(in_=c,relx=.5,rely=.5,anchor="center")
             self.page_label.configure(text="لا توجد صفحات")
             self.zoom_label.configure(text=f"{int(self.zoom.get())}%")
@@ -928,32 +1303,50 @@ class App(tk.Tk):
         else: self.status.set("تم اختيار الإعداد الجاهز. سيُستخدم عند المسح التالي.")
 
     def scan(self):
-        """Scan in a worker; publish the raw page before expensive enhancement."""
+        """Scan in a worker; publish each raw page before expensive enhancement."""
         if self.working:return
         st=self._settings()
         # مسح ملوّن من الماسح افتراضيًا: يتيح تغيير الفلتر لاحقًا دون إعادة المسح
         # ويحافظ على المعاينة الأصلية بالألوان. يمكن إيقافه من تبويب المسح.
         color=bool(self.scan_color.get()) or st["mode"] in ("magic","original")
+        driver=self.scan_driver.get()
+        source=self.scan_source.get()
+        device_key=self.scan_device.get()
+        try:hwnd=int(self.winfo_id())
+        except Exception:hwnd=0
         self._set_busy(True,"جارٍ الاتصال بالماسح الضوئي…")
         def worker():
             try:
-                path=wia_scan(st["dpi"],color)
-                # Prepare a quick preview immediately after WIA returns. The full-resolution
-                # source remains untouched and is the basis for all later processing.
-                raw=se.bgr_to_pil(se.load_bgr(path))
-                raw_preview=raw.copy(); raw_preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
-                page={"path":path,"rot":0,"manual_angle":0.0,"crop_norm":None,
-                      "img":raw,"preview":raw_preview,"orig_preview":raw_preview.copy(),
-                      "dpi":st["dpi"],"processing":True,"settings":st.copy()}
-                published=threading.Event()
-                def publish():
-                    try:self._page_captured(page)
-                    finally:published.set()
-                self._post_ui(publish)
-                # Wait until Tk has painted the original preview before starting CPU-heavy work.
-                published.wait(timeout=5)
-                self._process_page(page,st)
-                self._post_ui(lambda:self._page_processed(page))
+                options=sb.ScanOptions(dpi=st["dpi"],color=color,driver=driver,
+                                       device_key=device_key,source=source,parent_hwnd=hwnd)
+                paths=sb.scan(options)
+                paths=[_normalize_scan_file(path) for path in paths if path]
+                if not paths:
+                    raise RuntimeError("لم يُعد الماسح الضوئي أي صورة.")
+                for index,path in enumerate(paths):
+                    # Prepare a quick preview immediately after WIA/TWAIN returns. The
+                    # full-resolution source remains untouched and is the processing basis.
+                    raw=se.bgr_to_pil(se.load_bgr(path))
+                    raw_preview=raw.copy(); raw_preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
+                    page={"path":path,"rot":0,"manual_angle":0.0,"crop_norm":None,
+                          "img":raw,"preview":raw_preview,"orig_preview":raw_preview.copy(),
+                          "dpi":st["dpi"],"processing":True,"settings":st.copy(),
+                          "source_label":"scan"}
+                    final=index==len(paths)-1
+                    published=threading.Event()
+                    def publish(p=page,ready=published):
+                        try:self._page_captured(p)
+                        finally:ready.set()
+                    self._post_ui(publish)
+                    # Wait until Tk has painted the original preview before CPU-heavy work.
+                    published.wait(timeout=5)
+                    self._process_page(page,st)
+                    processed=threading.Event()
+                    def finish(p=page,last=final,done=processed):
+                        try:self._page_processed(p,final=last)
+                        finally:done.set()
+                    self._post_ui(finish)
+                    processed.wait(timeout=10)
             except Exception as e:
                 msg=str(e); self._post_ui(lambda:self._fail("فشل المسح أو المعالجة: "+msg))
         threading.Thread(target=worker,daemon=True).start()
@@ -969,10 +1362,10 @@ class App(tk.Tk):
         self.page_label.configure(text=f"الصفحة {self.current+1} / {len(self.pages)} — الأصل • جارٍ التحسين")
         self._save_session()
 
-    def _page_processed(self,page):
+    def _page_processed(self,page,final=True):
         page["processing"]=False
         self._discard_page_temp(page)
-        self._set_busy(False)
+        if final:self._set_busy(False)
         if self.opt_skip_blank.get() and len(self.pages)>1 and any(e is page for e in self.pages) and extras.is_blank(page["img"],float(self.blank_sens.get())):
             idx=next(i for i,e in enumerate(self.pages) if e is page); del self.pages[idx]
             self.current=max(0,min(self.current,len(self.pages)-1)); self.show_page(); self._refresh_thumbnails(); self._save_session()
@@ -987,8 +1380,32 @@ class App(tk.Tk):
                         ((" | "+page["note"]) if page.get("note") else ""))
         self._save_session()
 
-    def _fail(self,msg):
-        self._set_busy(False,msg); messagebox.showerror("Canon Scan Pro",msg)
+    def _fail(self,msg,page=None):
+        try:
+            self._set_busy(False)
+        except Exception:
+            pass
+        try:
+            if page is not None:
+                page["processing"]=False
+        except Exception:
+            pass
+        try:
+            self.show_page()
+        except Exception:
+            pass
+        try:
+            self._refresh_thumbnails()
+        except Exception:
+            pass
+        try:
+            self.status.set(msg)
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("Canon Scan Pro",msg)
+        except Exception:
+            pass
 
     def _post_manual(self,im,st):
         # Optional finishing tools, applied after the document filter.
@@ -1016,37 +1433,61 @@ class App(tk.Tk):
         return im
 
     def _process_page(self,page,st):
-        base=se.rotate_quarters(se.load_bgr(page["path"]),page["rot"])
-        out,angle,scale,note=se.process(base,st["mode"],st["crop"],st["deskew"],st["shadows"],
-                                       st["denoise"],st["dpi"],st["ai"],st["ink"],st["white"],
-                                       trim=st.get("trim",True),dust=st.get("dust",True),
-                                       defringe=st.get("defringe",True))
-        out=self._post_manual(out,st)
-        if page.get("manual_angle",0):
-            # الإشارة الموحّدة: الزاوية الموجبة = عكس عقارب الساعة (مثل تصحيح الميلان التلقائي)
-            out=out.rotate(float(page["manual_angle"]),expand=True,resample=Image.Resampling.BICUBIC,fillcolor="white")
-        cr=page.get("crop_norm")
-        if cr:
-            w,h=out.size; x1,y1,x2,y2=cr
-            box=(max(0,int(x1*w)),max(0,int(y1*h)),min(w,int(x2*w)),min(h,int(y2*h)))
-            if box[2]>box[0]+10 and box[3]>box[1]+10: out=out.crop(box)
-        preview=out.copy(); preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
-        original=se.bgr_to_pil(se._shrink(base,2000)[0])
-        page.update(img=out,preview=preview,orig_preview=original,mode=st["mode"],dpi=int(st["dpi"]*scale),
-                    auto_angle=angle,note=note,settings=st.copy())
+        try:
+            path=page.get("path")
+            if not path or not os.path.isfile(path):
+                raise RuntimeError("الملف غير موجود أو محذوف: %s" % (path or "غير محدد"))
+            base=se.rotate_quarters(se.load_bgr(path),page.get("rot",0))
+            out,angle,scale,note=se.process(base,st["mode"],st["crop"],st["deskew"],st["shadows"],
+                                           st["denoise"],st["dpi"],st["ai"],st["ink"],st["white"],
+                                           trim=st.get("trim",True),dust=st.get("dust",True),
+                                           defringe=st.get("defringe",True))
+            out=self._post_manual(out,st)
+            if page.get("manual_angle",0):
+                try:
+                    out=out.rotate(float(page["manual_angle"]),expand=True,resample=Image.Resampling.BICUBIC,fillcolor="white")
+                except Exception:
+                    pass
+            cr=page.get("crop_norm")
+            if cr and len(cr)==4:
+                try:
+                    w,h=out.size
+                    x1,y1,x2,y2=cr
+                    box=(max(0,int(round(x1*w))),max(0,int(round(y1*h))),min(w,int(round(x2*w))),min(h,int(round(y2*h))))
+                    if box[2]>box[0]+4 and box[3]>box[1]+4:
+                        out=out.crop(box)
+                except Exception:
+                    pass
+            try:
+                preview=out.copy()
+                preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
+            except Exception:
+                preview=out.copy()
+            try:
+                original=se.bgr_to_pil(se._shrink(base,2000)[0])
+            except Exception:
+                original=out.copy()
+            page.update(img=out,preview=preview,orig_preview=original,mode=st["mode"],dpi=int(st["dpi"]*scale) if scale else int(st["dpi"]),
+                        auto_angle=angle,note=note,settings=dict(st))
+        except Exception as e:
+            raise RuntimeError(str(e))
 
     def reprocess(self):
-        if self.working:return
-        if not self.pages:return messagebox.showinfo("تنبيه","امسح صفحة أولاً.")
-        page=self.pages[self.current]; st=self._settings()
+        if self.working:
+            return
+        if not self.pages:
+            return messagebox.showinfo("تنبيه","امسح صفحة أولاً.")
+        page=self.pages[self.current]
+        st=self._settings()
         page["processing"]=True
         self._set_busy(True,"جارٍ تطبيق التحسينات…")
         def worker():
             try:
                 self._process_page(page,st)
-                self._post_ui(lambda:self._page_ready(page,False))
+                self._post_ui(lambda p=page: self._page_ready(p,False))
             except Exception as e:
-                msg=str(e); self._post_ui(lambda:self._fail("فشلت المعالجة: "+msg))
+                msg=str(e)
+                self._post_ui(lambda m=msg, p2=page: self._fail("فشلت المعالجة: "+m, p2))
         threading.Thread(target=worker,daemon=True).start()
 
     def reprocess_all(self):
@@ -1078,19 +1519,60 @@ class App(tk.Tk):
             self.status.set(f"تم تطبيق التحسينات على {len(done)} صفحة | الحجم النهائي {w:,} × {h:,} بكسل")
 
     def _page_ready(self,page,is_new):
-        if is_new:self.pages.append(page); self.current=len(self.pages)-1
-        page["processing"]=False
-        self._discard_page_temp(page)
-        self.show_original=False; self._set_busy(False)
-        self.show_page(); self._refresh_thumbnails(); self._schedule_estimate(); self._save_session()
-        w,h=page["img"].size
-        self.status.set(f"جاهز: {w:,} × {h:,} بكسل | ميلان تلقائي {page.get('auto_angle',0):+.2f}°"+((" | "+page["note"]) if page.get("note") else ""))
+        try:
+            if is_new:
+                self.pages.append(page)
+                self.current=len(self.pages)-1
+            page["processing"]=False
+            self._discard_page_temp(page)
+            self.show_original=False
+            self._set_busy(False)
+            try:
+                self.show_page()
+            except Exception:
+                pass
+            try:
+                self._refresh_thumbnails()
+            except Exception:
+                pass
+            try:
+                self._schedule_estimate()
+            except Exception:
+                pass
+            try:
+                self._save_session()
+            except Exception:
+                pass
+            try:
+                w,h=page["img"].size
+                self.status.set(f"جاهز: {w:,} × {h:,} بكسل | ميلان تلقائي {page.get('auto_angle',0):+.2f}°"+((" | "+page["note"]) if page.get("note") else ""))
+            except Exception:
+                self.status.set("جاهز")
+        except Exception:
+            try:
+                self._set_busy(False)
+            except Exception:
+                pass
 
     def _on_resize(self,_e):
-        if self._resize_job:
-            try:self.after_cancel(self._resize_job)
-            except Exception:pass
-        self._resize_job=self.after(100,self.show_page)
+        if getattr(self, "_edge_crop_rect", None):
+            try:
+                self.canvas.delete(self._edge_crop_rect)
+                self._edge_crop_rect = None
+            except Exception:
+                pass
+        if getattr(self, "_resize_job", None):
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        try:
+            self._resize_job=self.after(100,self.show_page)
+        except Exception:
+            try:
+                self.show_page()
+            except Exception:
+                pass
 
     def _snapshot_page(self,page):
         # لا نحفظ orig_preview: يُعاد توليده من الملف الأصلي عند التراجع،
@@ -1204,29 +1686,68 @@ class App(tk.Tk):
         if not self.pages:return
         self.compare_mode.set(not self.compare_mode.get()); self.show_original=False; self.show_page()
 
-    def _save_session(self):
-        """Persist the current session without ever overwriting a source page mid-copy.
+    # ------------------------------------------------------------- الجلسات: الحفظ
+    _ARCHIVE_KEEP=15
 
-        Reordering restored pages makes page_001… both a source and a destination.
-        Copying in one pass would overwrite a source before it is read, so every
-        changed file is first copied to a unique temp name and only then renamed.
-        """
-        if getattr(self,"_restoring",False):return
+    @property
+    def _archive_root(self):
+        return os.path.join(self._session_dir,"archive")
+
+    @staticmethod
+    def _json_default(o):
+        try:return float(o)
+        except Exception:return str(o)
+
+    @staticmethod
+    def _resolve_item_path(item,base):
+        """يجد ملف الصفحة: الاسم النسبي داخل مجلد الجلسة أولًا (يبقى صالحًا لو نُقل المجلد)، ثم المسار القديم."""
+        cands=[]
+        if item.get("file"):cands.append(os.path.join(base,item["file"]))
+        p=item.get("path") or ""
+        if p:
+            cands.append(os.path.join(base,os.path.basename(p)))
+            cands.append(p)
+        for c in cands:
+            if os.path.isfile(c):return c
+        return None
+
+    def _clear_session_files(self,d=None):
+        d=d or self._session_dir
+        try:names=os.listdir(d)
+        except OSError:return
+        for n in names:
+            if n.startswith("page_") or n.startswith(".tmp_") or n in ("session.json","session.tmp"):
+                try:os.remove(os.path.join(d,n))
+                except Exception:pass
+
+    def _save_session(self):
+        """يحفظ الجلسة الحالية دون الكتابة فوق أي ملف مصدر أثناء نسخه. يرجع True عند النجاح."""
+        if getattr(self,"_restoring",False):return True
         temp_files=[]
         try:
-            os.makedirs(self._session_dir,exist_ok=True); plans=[]
+            os.makedirs(self._session_dir,exist_ok=True)
+            if not self.pages:
+                # لا نمسح الجلسة المحفوظة قبل أن ينتهي تحميلها عند بدء التشغيل
+                if getattr(self,"_session_loaded",False):self._clear_session_files()
+                self._session_error=None
+                return True
+            plans=[]
             for i,page in enumerate(self.pages):
                 src=page.get("path")
                 if not src or not os.path.exists(src): continue
                 ext=os.path.splitext(src)[1] or ".png"
                 stable=os.path.join(self._session_dir,f"page_{i+1:03d}{ext}")
                 plans.append((page,src,stable))
+            if not plans:
+                self._session_error="ملفات الصفحات الأصلية غير موجودة"
+                return False                      # لا نلمس الجلسة المحفوظة سابقًا
             for page,src,stable in plans:
                 if os.path.normcase(os.path.abspath(src))==os.path.normcase(os.path.abspath(stable)): continue
                 tmp=os.path.join(self._session_dir,f".tmp_{uuid.uuid4().hex}{os.path.splitext(stable)[1]}")
                 shutil.copy2(src,tmp); temp_files.append((tmp,stable))
             for tmp,stable in temp_files:
                 os.replace(tmp,stable)
+            temp_files=[]
             for page,src,stable in plans:
                 page["path"]=stable
                 if self._is_temp_page(src):
@@ -1236,21 +1757,176 @@ class App(tk.Tk):
                         self._remove_temp_file(src)
             for page in self.pages:
                 if not page.get("processing"):self._discard_page_temp(page)
-            entries=[{"path":stable,"rot":page.get("rot",0),"manual_angle":page.get("manual_angle",0),
-                      "crop_norm":page.get("crop_norm"),"dpi":page.get("dpi",300),
-                      "settings":page.get("settings",self._settings())}
+            entries=[{"file":os.path.basename(stable),"path":stable,"rot":page.get("rot",0),
+                      "manual_angle":page.get("manual_angle",0),"crop_norm":page.get("crop_norm"),
+                      "dpi":page.get("dpi",300),"settings":page.get("settings") or self._settings()}
                      for page,_src,stable in plans]
             used=[os.path.basename(stable) for _page,_src,stable in plans]
-            current=min(max(0,int(self.current)),max(0,len(entries)-1))
+            cur_page=self.pages[self.current] if 0<=self.current<len(self.pages) else None
+            current=0
+            for n,(page,_s,_st) in enumerate(plans):
+                if page is cur_page:current=n;break
             tmp=os.path.join(self._session_dir,"session.tmp")
-            with open(tmp,"w",encoding="utf-8") as f:json.dump({"pages":entries,"current":current},f,ensure_ascii=False)
+            with open(tmp,"w",encoding="utf-8") as f:
+                json.dump({"version":2,"pages":entries,"current":current,"saved_at":datetime.now().isoformat()},
+                          f,ensure_ascii=False,default=self._json_default)
             os.replace(tmp,os.path.join(self._session_dir,"session.json"))
             self._cleanup_session_files(used)
-        except Exception:
+            self._session_error=None
+            return True
+        except Exception as e:
             for tmp,_stable in temp_files:
                 try:os.remove(tmp)
                 except Exception:pass
+            self._session_error=str(e)
             traceback.print_exc()
+            return False
+
+    # ------------------------------------------------------------- الجلسات: الأرشيف («الجلسات السابقة»)
+    def _prune_archive(self,protect=None):
+        try:
+            root=self._archive_root
+            names=sorted((n for n in os.listdir(root) if os.path.isdir(os.path.join(root,n))),reverse=True)
+        except OSError:
+            return
+        prot=os.path.normcase(os.path.abspath(protect)) if protect else None
+        kept=0
+        for n in names:
+            d=os.path.join(root,n)
+            if prot and os.path.normcase(os.path.abspath(d))==prot:continue
+            if self._session_is_pinned(d):continue          # الجلسات المثبتة تُحفظ دائمًا
+            if kept<self._ARCHIVE_KEEP:
+                kept+=1; continue
+            shutil.rmtree(d,ignore_errors=True)
+
+    def _archive_session_files(self,move=True,protect=None):
+        """ينسخ ملفات مجلد الجلسة الحالية (session.json + page_*) إلى مجلد جديد في الأرشيف.
+        يرجع المسار عند النجاح، None إن لم توجد جلسة صالحة، False إن فشل النسخ."""
+        cur_json=os.path.join(self._session_dir,"session.json")
+        if not os.path.isfile(cur_json):return None
+        try:
+            with open(cur_json,encoding="utf-8") as f:data=json.load(f)
+        except Exception:
+            return None
+        if not any(self._resolve_item_path(it,self._session_dir) for it in (data.get("pages") or [])):
+            return None
+        dest=os.path.join(self._archive_root,datetime.now().strftime("%Y%m%d_%H%M%S")+"_"+uuid.uuid4().hex[:4])
+        try:
+            os.makedirs(dest,exist_ok=True)
+            for n in os.listdir(self._session_dir):
+                if n.startswith("page_"):
+                    shutil.copy2(os.path.join(self._session_dir,n),os.path.join(dest,n))
+            shutil.copy2(cur_json,os.path.join(dest,"session.json"))
+        except Exception:
+            traceback.print_exc(); shutil.rmtree(dest,ignore_errors=True); return False
+        if move:self._clear_session_files()
+        self._prune_archive(protect)
+        try:self._remember_session(os.path.join(dest,"session.json"))
+        except Exception:pass
+        return dest
+
+    def _archive_current_session(self,move=True,protect=None):
+        """يحفظ الجلسة الحالية في الأرشيف (ويفرّغ مجلد الجلسة عند move=True). يرجع المسار أو None."""
+        if getattr(self,"_restoring",False) or not self.pages:return None
+        if not self._save_session():return None             # نضمن أن الملفات محدّثة قبل النسخ
+        return self._archive_session_files(move,protect) or None
+
+    def _startup_session(self):
+        """عند بدء البرنامج نبدأ بمساحة عمل فارغة؛ جلسة المرة السابقة تنتقل إلى «الجلسات السابقة»
+        فلا تختلط مع المسح الجديد، وتفتحها وقتما شئت."""
+        self._session_loaded=True
+        try:
+            if self._archive_session_files(move=True) is None:
+                self._clear_session_files()                  # بقايا ملفات بلا جلسة صالحة
+        except Exception:
+            traceback.print_exc()
+        self.after(150,self._refresh_empty_state)
+
+    def _refresh_empty_state(self):
+        if not self.pages and not self._restoring:
+            try:self.show_page()                              # يعيد رسم بطاقات الجلسات السابقة
+            except Exception:traceback.print_exc()
+
+    def save_session_manual(self):
+        if not self.pages:
+            messagebox.showinfo("حفظ الجلسة","لا توجد صفحات لحفظها.")
+            return
+        if self._restoring or self.working:
+            messagebox.showinfo("حفظ الجلسة","انتظر انتهاء العملية الحالية ثم أعد المحاولة.")
+            return
+        if self._archive_current_session(move=False) is None:
+            messagebox.showerror("حفظ الجلسة","تعذّر حفظ الجلسة:\n"+str(getattr(self,"_session_error","") or "خطأ غير معروف"))
+            return
+        self.status.set("تم حفظ نسخة من الجلسة في «الجلسات السابقة».")
+        messagebox.showinfo("حفظ الجلسة","تم حفظ نسخة من الجلسة الحالية.\nيمكنك فتحها لاحقًا من «فتح جلسة سابقة».\n(الجلسة الحالية تُحفظ تلقائيًا أيضًا وتُستعاد عند فتح البرنامج.)")
+
+    def load_saved_session(self):
+        if self.working:
+            messagebox.showinfo("المعالجة جارية","انتظر انتهاء العملية الحالية.")
+            return
+        if self._restoring:
+            messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة الحالية.")
+            return
+        sessions=self._list_saved_sessions(thumbs=1000)
+        if not sessions:
+            messagebox.showinfo("الجلسات السابقة","لا توجد جلسات سابقة محفوظة.\nتُحفظ الجلسة هنا عند «جلسة جديدة» أو «إفراغ الصفحات» أو «حفظ الجلسة الآن».")
+            return
+        self._session_picker(sessions)
+
+    def _session_picker(self,sessions):
+        win=tk.Toplevel(self); win.title("الجلسات السابقة — إدارة وتبديل"); win.configure(bg=T["bg"])
+        win.transient(self); win.resizable(True,True)
+        sw,sh=self.winfo_screenwidth(),self.winfo_screenheight()
+        w,h=min(780,sw-120),min(640,sh-120)
+        win.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2-40)}")
+        win.minsize(640,440)
+        root=ui.Themed(win,"bg"); root.pack(fill="both",expand=True)
+        if self.pages:
+            ui.label(root,f"الجلسة الحالية مفتوحة ({len(self.pages)} صفحة) وستُحفظ تلقائيًا في «الجلسات السابقة» قبل التبديل.",
+                     "small","accent_soft_fg","bg",wraplength=w-80,anchor="e").pack(fill="x",padx=18,pady=(12,0))
+        def close():
+            win.destroy()
+        def open_session(s):
+            win.destroy(); self._load_session_from_path(s["path"])
+        def previous():
+            if not self._previous_session_path():
+                messagebox.showinfo("الجلسات السابقة","لا توجد جلسة سابقة يمكن الرجوع إليها.",parent=win)
+                return
+            win.destroy(); self.switch_to_previous_session()
+        browser=SessionsBrowser(root,self,compact=False,show_title=True,bg_token="bg",
+                                on_open=open_session,on_previous=previous,on_close=close,initial=sessions)
+        browser.pack(fill="both",expand=True,padx=18,pady=14)
+        win.bind("<Escape>",lambda _e:win.destroy())
+        win.bind("<Down>",lambda _e:browser.move_selection(1))
+        win.bind("<Up>",lambda _e:browser.move_selection(-1))
+        win.bind("<Return>",lambda _e:browser.open_selected())
+        try:win.after(60,win.grab_set)
+        except Exception:pass
+
+    def _remove_archive_dir(self,d):
+        """يحذف مجلد جلسة مؤرشفة فقط (يرفض أي مجلد خارج الأرشيف)."""
+        try:
+            dd=os.path.abspath(d); root=os.path.abspath(self._archive_root)
+            if os.path.normcase(os.path.dirname(dd))!=os.path.normcase(root):return False
+            shutil.rmtree(dd,ignore_errors=True); return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _session_is_pinned(d):
+        try:return os.path.isfile(os.path.join(d,".pinned"))
+        except Exception:return False
+
+    def _toggle_session_pin(self,d):
+        """يثبّت الجلسة (تبقى بعد الحد الأقصى) أو يلغي التثبيت. يرجع الحالة الجديدة."""
+        try:
+            marker=os.path.join(d,".pinned")
+            if os.path.isfile(marker):
+                os.remove(marker); return False
+            with open(marker,"w",encoding="utf-8") as f:f.write("pinned")
+            return True
+        except Exception:
+            return self._session_is_pinned(d)
 
     @staticmethod
     def _is_temp_page(path):
@@ -1297,59 +1973,212 @@ class App(tk.Tk):
         except Exception:
             traceback.print_exc()
 
-    def _reset_session_state(self):
-        """يفرّغ الصفحات والسجل ويحذف ملفات الجلسة المحفوظة (مع الإبقاء على التفضيلات)."""
-        self.pages=[]; self.current=0
+    def _reset_session_state(self,archive=True):
+        """يفرّغ الصفحات والسجل. عند archive=True تُحفظ الجلسة الحالية أولًا في «الجلسات السابقة»."""
+        if archive and self.pages:
+            if self._archive_current_session() is None:
+                if not messagebox.askyesno("حفظ الجلسة الحالية","تعذّر حفظ الجلسة الحالية في «الجلسات السابقة».\nهل تريد المتابعة وفقدانها؟"):
+                    return False
+        self.pages=[]; self.current=0; self._current_session_path=None
         self._history.clear(); self._redo.clear(); self._history_bytes=0
         self.show_original=False; self.compare_mode.set(False)
         self._reset_crop_selection()
-        try:
-            for name in os.listdir(self._session_dir):
-                if name.startswith("page_") or name in ("session.json","session.tmp"):
-                    try:os.remove(os.path.join(self._session_dir,name))
-                    except Exception:pass
-        except Exception:pass
-        self.show_page(); self._refresh_thumbnails(); self._schedule_estimate()
-        self._save_session()
+        self._clear_session_files()
+        for fn in (self.show_page,self._refresh_thumbnails,self._schedule_estimate,self._save_session):
+            try:fn()
+            except Exception:traceback.print_exc()
+        return True
 
     def new_session(self):
-        if self._restoring:return messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة السابقة قبل بدء جلسة جديدة.")
-        if self.working:return messagebox.showinfo("المعالجة جارية","انتظر انتهاء المسح أو التحسين قبل بدء جلسة جديدة.")
-        if self.pages and not messagebox.askyesno("جلسة جديدة","بدء جلسة جديدة وإزالة كل الصفحات الحالية؟\nلن تُحذف الملفات التي حفظتها على القرص."):return
-        self._reset_session_state()
+        if self._restoring:
+            messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة السابقة قبل بدء جلسة جديدة.")
+            return
+        if self.working:
+            messagebox.showinfo("المعالجة جارية","انتظر انتهاء المسح أو التحسين قبل بدء جلسة جديدة.")
+            return
+        if self.pages:
+            if not messagebox.askyesno("جلسة جديدة","بدء جلسة جديدة وإزالة كل الصفحات الحالية؟\nستُحفظ الجلسة الحالية في «الجلسات السابقة» ويمكنك فتحها لاحقًا.\nلن تُحذف الملفات التي حفظتها على القرص."):
+                return
+        else:
+            if not messagebox.askyesno("جلسة جديدة","هل تريد بدء جلسة جديدة؟"):
+                return
+        if not self._reset_session_state():return
         self.status.set("تم بدء جلسة جديدة — ضع الورقة على الماسح ثم اضغط «بدء المسح الضوئي».")
 
-    def _restore_session(self):
-        file=os.path.join(self._session_dir,"session.json")
-        if not os.path.isfile(file):return
+    def close_session(self):
+        if self._restoring:
+            messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة السابقة قبل إغلاق الجلسة.")
+            return
+        if self.working:
+            messagebox.showinfo("المعالجة جارية","انتظر انتهاء المسح أو التحسين قبل إغلاق الجلسة.")
+            return
+        if not self.pages:
+            self.status.set("لا توجد صفحات لإغلاق الجلسة.")
+            return
+        if not messagebox.askyesno("إغلاق الجلسة","هل تريد إغلاق الجلسة الحالية وحذف جميع الصفحات؟\nسيُحذف ما تبقى من ملفات هذه الجلسة ولن يُحفظ في «الجلسات السابقة»."):
+            return
+        self.pages=[]; self.current=0
+        self._history.clear(); self._redo.clear(); self._history_bytes=0
+        self.show_original=False
+        try:self.compare_mode.set(False)
+        except Exception:pass
+        self._reset_crop_selection()
+        self._clear_session_files()
+        for fn in (self.show_page,self._refresh_thumbnails,self._schedule_estimate,self._save_session):
+            try:fn()
+            except Exception:pass
+        self.status.set("تم إغلاق الجلسة وحذف جميع الصفحات.")
+
+    # ------------------------------------------------------------- الجلسات: القائمة والاستعادة
+    def _list_saved_sessions(self,thumbs=6):
+        """الجلسات المؤرشفة فقط (الأحدث أولًا). الجلسة الحالية تُستعاد تلقائيًا عند بدء البرنامج."""
+        out=[]
+        root=self._archive_root
+        try:names=sorted((n for n in os.listdir(root) if os.path.isdir(os.path.join(root,n))),reverse=True)
+        except OSError:return out
+        for n in names:
+            d=os.path.join(root,n); sj=os.path.join(d,"session.json")
+            try:
+                with open(sj,encoding="utf-8") as f:data=json.load(f)
+            except Exception:
+                continue
+            pages=data.get("pages") or []
+            if not pages:continue
+            thumb=None
+            if len(out)<thumbs:
+                p=self._resolve_item_path(pages[0],d)
+                if p:
+                    try:
+                        with Image.open(p) as im:
+                            im=ImageOps.exif_transpose(im).convert("RGB"); im.thumbnail((200,150)); thumb=im.copy()
+                    except Exception:
+                        thumb=None
+            out.append({"dir":d,"path":sj,"name":n,"count":len(pages),"thumb":thumb,
+                        "pinned":self._session_is_pinned(d),
+                        "when":(data.get("saved_at") or "")[:16].replace("T"," ")})
+        out.sort(key=lambda s:s["name"],reverse=True)       # الأحدث أولًا
+        out.sort(key=lambda s:not s["pinned"])              # المثبتة أولًا
+        return out
+
+    def _delete_session_folder(self,d):
+        if not d:return
+        if not messagebox.askyesno("حذف الجلسة","هل تريد حذف هذه الجلسة المحفوظة نهائيًا؟"):return
+        if not self._remove_archive_dir(d):
+            messagebox.showerror("خطأ","تعذّر حذف الجلسة.")
+        if not self.pages:
+            try:self.show_page()                  # يعيد رسم بطاقات الجلسات
+            except Exception:pass
+
+    def _load_session_from_path(self,p):
+        if self._restoring:
+            messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة الحالية.")
+            return
+        if self.working:
+            messagebox.showinfo("المعالجة جارية","انتظر انتهاء العملية الحالية.")
+            return
+        if not os.path.isfile(p):
+            messagebox.showinfo("الجلسات السابقة","هذه الجلسة لم تعد موجودة.")
+            if not self.pages:self.show_page()
+            return
+        d=os.path.dirname(p)
+        if self.pages:
+            if not messagebox.askyesno("فتح جلسة سابقة","ستُحفظ الجلسة الحالية في «الجلسات السابقة» ثم تُستبدل بالجلسة المختارة.\nمتابعة؟"):
+                return
+            if self._archive_current_session(protect=d) is None:
+                if not messagebox.askyesno("فتح جلسة سابقة","تعذّر حفظ الجلسة الحالية.\nهل تريد المتابعة وفقدانها؟"):
+                    return
+            self._reset_session_state(archive=False)
+        self._current_session_path=os.path.abspath(p)
+        self._remember_session(p)
+        self._restore_session(session_file=p,consume_dir=d)
+
+    # ------------------------------------------------------------- الجلسات: التنقّل بينها
+    def _remember_session(self,path):
+        """يتذكّر آخر الجلسات المفتوحة للرجوع إليها والتبديل بينها لاحقًا."""
+        try:
+            p=os.path.abspath(path)
+            data=self._load_prefs()
+            hist=[x for x in (data.get("session_history") or []) if isinstance(x,str) and os.path.normcase(os.path.abspath(x))!=os.path.normcase(p)]
+            hist.append(p)
+            data["session_history"]=hist[-20:]
+            with open(os.path.join(self._session_dir,"prefs.json"),"w",encoding="utf-8") as f:
+                json.dump(data,f,ensure_ascii=False)
+        except Exception:
+            traceback.print_exc()
+
+    def _previous_session_path(self):
+        """مسار آخر جلسة مختلفة عن الحالية وما زالت موجودة."""
+        try:
+            data=self._load_prefs()
+            cur=os.path.normcase(os.path.abspath(self._current_session_path)) if self._current_session_path else ""
+            for p in reversed([x for x in (data.get("session_history") or []) if isinstance(x,str)]):
+                try:
+                    if cur and os.path.normcase(os.path.abspath(p))==cur:continue
+                    if os.path.isfile(p):return p
+                except Exception:
+                    continue
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    def switch_to_previous_session(self):
+        """يرجع إلى الجلسة السابقة التي كانت مفتوحة (تبديل سريع بين الجلسات)."""
+        p=self._previous_session_path()
+        if not p:
+            messagebox.showinfo("الجلسات السابقة","لا توجد جلسة سابقة يمكن الرجوع إليها.")
+            return
+        self._load_session_from_path(p)
+
+    def _restore_session(self,session_file=None,silent=False,consume_dir=None):
+        """يستعيد صفحات جلسة. silent=True عند بدء التشغيل: لا رسائل منبثقة إن لم توجد جلسة."""
+        file=session_file or os.path.join(self._session_dir,"session.json")
+        base=os.path.dirname(file)
+        if not os.path.isfile(file):
+            self._session_loaded=True
+            if not silent:messagebox.showinfo("الجلسات السابقة","لا توجد جلسة محفوظة.")
+            return
         try:
             with open(file,encoding="utf-8") as f:data=json.load(f)
         except Exception:
-            self.status.set("تعذرت قراءة الجلسة السابقة؛ يمكنك متابعة العمل بشكل الطبيعي."); return
-        items=[item for item in data.get("pages",[]) if os.path.isfile(item.get("path",""))]
-        if not items:return
-        current=max(0,min(len(items)-1,int(data.get("current",0))))
+            self._session_loaded=True
+            try:os.replace(file,os.path.join(base,"session.corrupt.json"))     # نحتفظ بالملف التالف ولا نكرر الخطأ
+            except Exception:pass
+            self.status.set("تعذرت قراءة الجلسة السابقة؛ يمكنك متابعة العمل بشكل طبيعي.")
+            return
+        items=[]
+        for idx,item in enumerate(data.get("pages",[])):
+            path=self._resolve_item_path(item,base)
+            if path:items.append((idx,dict(item,path=path)))
+        if not items:
+            self._session_loaded=True
+            if not silent:messagebox.showinfo("الجلسات السابقة","لا توجد صفحات صالحة في الجلسة المحفوظة.")
+            return
+        try:cur_src=int(data.get("current",0))
+        except Exception:cur_src=0
         defaults=self._settings()
         self._restoring=True
-        self.status.set("جارٍ استعادة جلسة العمل السابقة…")
+        self._set_busy(True,"جارٍ فتح الجلسة… (تظهر الصفحات فورًا ثم يكتمل تحسينها)")
         def worker():
-            restored=[]
+            # المرحلة 1 (سريعة): قراءة الصور فقط لعرضها فورًا. التحسين الثقيل يأتي بعدها في الخلفية.
+            pairs=[]
             try:
-                for item in items:
+                for idx,item in items:
                     try:
                         with Image.open(item["path"]) as source:
                             im=ImageOps.exif_transpose(source).convert("RGB")
                     except Exception:
-                        continue          # ملف مفقود: نتخطاه بدل إفشال الاستعادة كلها
+                        traceback.print_exc(); continue
                     preview=im.copy(); preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
                     page={"path":item["path"],"rot":item.get("rot",0),"manual_angle":item.get("manual_angle",0),
                           "crop_norm":item.get("crop_norm"),"img":im,"preview":preview,"orig_preview":preview.copy(),
                           "dpi":item.get("dpi",300),"processing":True,
                           "settings":item.get("settings") or dict(defaults),"source_label":"restored"}
-                    try:self._process_page(page,page["settings"])
-                    except Exception:pass
-                    restored.append(page)
-                self._post_ui(lambda:self._session_restored(restored,current))
+                    pairs.append((idx,page))
+                cur=0
+                for n,(i,_p) in enumerate(pairs):
+                    if i<=cur_src:cur=n
+                restored=[p for _i,p in pairs]
+                self._post_ui(lambda r=restored,c=cur:self._session_restored(r,c,consume_dir))
             except Exception:
                 traceback.print_exc()
                 self._post_ui(lambda:self._set_restoring(False))
@@ -1357,24 +2186,73 @@ class App(tk.Tk):
 
     def _set_restoring(self,value):
         self._restoring=bool(value)
+        if not value:
+            self._session_loaded=True
+            self._set_busy(False)
+            self.status.set("تعذّرت استعادة الجلسة. لم يُحذف أي ملف من الجلسة المحفوظة.")
 
-    def _session_restored(self,pages,current):
+    def _session_restored(self,pages,current,consume_dir=None):
         self._restoring=False
-        for page in pages: page["processing"]=False
+        self._session_loaded=True
+        if not pages:
+            self._set_busy(False)
+            self.status.set("تعذّر فتح صور الجلسة (تالفة أو مقفلة). لم يُحذف أي ملف.")
+            return
         if self.pages:
             # المستخدم مسح صفحة أثناء الاستعادة: لا نفقدها.
             self.pages=self.pages+pages
             self.current=len(self.pages)-1
         else:
             self.pages=pages
-            self.current=min(max(0,int(current)),max(0,len(pages)-1)) if pages else 0
-        self.show_original=False; self.compare_mode.set(False)
-        self.show_page(); self._refresh_thumbnails(); self._schedule_estimate(); self._save_session()
-        self.status.set("تمت استعادة جلسة العمل السابقة تلقائيًا.")
+            self.current=min(max(0,int(current)),max(0,len(pages)-1))
+        first=self.pages[self.current]
+        self.show_original=True                       # تظهر النسخة الأصلية فورًا حتى ينتهي التحسين
+        self.show_page(); self._refresh_thumbnails()
+        ok=self._save_session()
+        if consume_dir and ok:
+            # صارت الجلسة هي الحالية (ونُسخت ملفاتها لمجلد الجلسة) فنحذف نسخة الأرشيف حتى لا تتكرر
+            root=os.path.normcase(os.path.abspath(consume_dir))+os.sep
+            if all(not os.path.normcase(os.path.abspath(p.get("path",""))).startswith(root) for p in pages):
+                self._remove_archive_dir(consume_dir)
+        self._enhance_restored(pages,first,"تم فتح الجلسة المحفوظة." if consume_dir else "تمت استعادة جلسة العمل السابقة.")
+
+    def _enhance_restored(self,pages,first,done_msg):
+        """المرحلة 2: تحسين الصفحات المستعادة في الخلفية (الصفحة المعروضة أولًا) مع تحديث الواجهة بعد كل صفحة."""
+        todo=sorted(pages,key=lambda p:0 if p is first else 1)
+        total=len(todo)
+        self._set_busy(True,f"جارٍ تحسين الصفحات المستعادة (0/{total})…")
+        def worker():
+            for n,page in enumerate(todo,1):
+                try:
+                    self._process_page(page,page["settings"])
+                except Exception:
+                    traceback.print_exc()
+                    page["note"]="تعذّرت معالجة الصفحة عند الاستعادة (تُعرض النسخة الأصلية)"
+                self._post_ui(lambda p=page,k=n:self._restored_page_done(p,k,total,done_msg))
+        threading.Thread(target=worker,daemon=True).start()
+
+    def _restored_page_done(self,page,n,total,done_msg):
+        page["processing"]=False
+        try:self._discard_page_temp(page)
+        except Exception:pass
+        if self.pages and self.pages[self.current] is page:
+            self.show_original=False; self.show_page()
+        self._refresh_thumbnails()
+        if n>=total:
+            self._set_busy(False)
+            self._schedule_estimate(); self._save_session()
+            self.status.set(done_msg)
+        else:
+            self.status.set(f"جارٍ تحسين الصفحات المستعادة ({n}/{total})…")
 
     def move(self,step):
         if self.pages:
-            self.current=max(0,min(len(self.pages)-1,self.current+step)); self._reset_crop_selection()
+            self.current=max(0,min(len(self.pages)-1,self.current+step))
+            self._reset_crop_selection()
+            try:
+                self.show_page()
+            except Exception:
+                pass
             self.show_original=False
             self.show_page(); self._schedule_estimate()
 
@@ -1405,6 +2283,12 @@ class App(tk.Tk):
     def _reset_crop_selection(self):
         """إلغاء أي تحديد قص قائم (عند تبديل الصفحة أو تغيير العرض أو بعد التطبيق)."""
         self._crop_start=None
+        self._edge_crop_drag=None
+        self._edge_crop_dir=None
+        if getattr(self,"_edge_crop_rect",None):
+            try:self.canvas.delete(self._edge_crop_rect)
+            except Exception:pass
+        self._edge_crop_rect=None
         if hasattr(self,"_crop_pixels"):delattr(self,"_crop_pixels")
         if getattr(self,"_crop_rect_id",None):
             try:self.canvas.delete(self._crop_rect_id)
@@ -1419,38 +2303,131 @@ class App(tk.Tk):
         self.canvas.configure(cursor="crosshair")
         self.status.set("اسحب بالماوس فوق الصفحة لتحديد مستطيل القص، ثم اضغط «قص التحديد».")
 
+    # ---------------- الاقتصاص بالسحب من حواف الصورة (الهامش) ----------------
+    _EDGE_MARGIN=18
+
+    def _edge_hit(self,e):
+        """يرجع اتجاه الحافة تحت المؤشر: left/right/top/bottom أو None."""
+        if not self.pages or not getattr(self,"_canvas_img_rect",None):return None
+        x1,y1,x2,y2=self._canvas_img_rect; m=self._EDGE_MARGIN
+        if x1<=e.x<=x1+m and y1+m<=e.y<=y2-m:return "left"
+        if x2-m<=e.x<=x2 and y1+m<=e.y<=y2-m:return "right"
+        if y1<=e.y<=y1+m and x1+m<=e.x<=x2-m:return "top"
+        if y2-m<=e.y<=y2 and x1+m<=e.x<=x2-m:return "bottom"
+        return None
+
     def _crop_press(self,e):
-        if not self.pages or not self._canvas_img_rect:return
+        if not self.pages or not getattr(self,"_canvas_img_rect",None):return
         x1,y1,x2,y2=self._canvas_img_rect
+        d=self._edge_hit(e)
+        if d:
+            self._edge_crop_drag=True
+            self._edge_crop_dir=d
+            self._edge_base=tuple(self.pages[self.current].get("crop_norm") or (0.0,0.0,1.0,1.0))
+            self._edge_new=self._edge_base
+            self._edge_hist=False
+            self._clear_edge_overlay()
+            return
         if x1<=e.x<=x2 and y1<=e.y<=y2:
             self._crop_start=(e.x,e.y)
-            if self._crop_rect_id:self.canvas.delete(self._crop_rect_id)
+            if getattr(self,"_crop_rect_id",None):
+                try:self.canvas.delete(self._crop_rect_id)
+                except Exception:pass
             self._crop_rect_id=self.canvas.create_rectangle(e.x,e.y,e.x,e.y,outline=T["accent"],width=2,dash=(5,3))
 
+    def _clear_edge_overlay(self):
+        for name in ("_edge_crop_rect","_edge_shade_id"):
+            item=getattr(self,name,None)
+            if item:
+                try:self.canvas.delete(item)
+                except Exception:pass
+            setattr(self,name,None)
+
     def _crop_drag(self,e):
+        # سحب حافة الهامش: نحدّث القيمة المقترحة ونرسم التظليل فقط (بدون show_page حتى لا تُمسح الحالة)
+        if getattr(self,"_edge_crop_drag",None) and getattr(self,"_edge_crop_dir",None):
+            x1,y1,x2,y2=self._canvas_img_rect
+            dispw=max(1.0,x2-x1); disph=max(1.0,y2-y1)
+            bx1,by1,bx2,by2=self._edge_base
+            nx1,ny1,nx2,ny2=bx1,by1,bx2,by2
+            t=lambda v,o,s:max(0.0,min(1.0,(v-o)/s))
+            d=self._edge_crop_dir
+            if d=="left":
+                nx1=bx1+t(e.x,x1,dispw)*(bx2-bx1); nx1=min(nx1,bx2-0.01)
+            elif d=="right":
+                nx2=bx1+t(e.x,x1,dispw)*(bx2-bx1); nx2=max(nx2,bx1+0.01)
+            elif d=="top":
+                ny1=by1+t(e.y,y1,disph)*(by2-by1); ny1=min(ny1,by2-0.01)
+            elif d=="bottom":
+                ny2=by1+t(e.y,y1,disph)*(by2-by1); ny2=max(ny2,by1+0.01)
+            self._edge_new=(nx1,ny1,nx2,ny2)
+            # التظليل على الجزء الذي سيُحذف
+            ex=max(x1,min(x2,e.x)); ey=max(y1,min(y2,e.y))
+            box={"left":(x1,y1,ex,y2),"right":(ex,y1,x2,y2),"top":(x1,y1,x2,ey),"bottom":(x1,ey,x2,y2)}[d]
+            self._clear_edge_overlay()
+            try:
+                self._edge_crop_rect=self.canvas.create_rectangle(*box,fill=T["accent"],stipple="gray50",outline="")
+                self.canvas.configure(cursor="sb_h_double_arrow" if d in("left","right") else "sb_v_double_arrow")
+            except Exception:pass
+            return
         if self._crop_start and self._crop_rect_id:
             x1,y1,x2,y2=self._canvas_img_rect
             x=max(x1,min(x2,e.x)); y=max(y1,min(y2,e.y))
             self.canvas.coords(self._crop_rect_id,self._crop_start[0],self._crop_start[1],x,y)
 
     def _crop_release(self,e):
-        if not self._crop_start or not self._canvas_img_rect:return
+        if getattr(self,"_edge_crop_drag",None):
+            new=getattr(self,"_edge_new",None); base=getattr(self,"_edge_base",None)
+            self._edge_crop_drag=None; self._edge_crop_dir=None
+            self._clear_edge_overlay()
+            try:self.canvas.configure(cursor="")
+            except Exception:pass
+            if new and base and tuple(new)!=tuple(base):
+                self._push_history()
+                self.pages[self.current]["crop_norm"]=tuple(new)
+                self.reprocess()
+                try:self._save_session()
+                except Exception:pass
+                self.status.set("تم اقتصاص الهامش. يمكنك التراجع بـ Ctrl+Z أو الضغط على «إلغاء القص».")
+            return
+        if not getattr(self,"_crop_start",None) or not getattr(self,"_canvas_img_rect",None):return
         x1,y1,x2,y2=self._canvas_img_rect
         x=max(x1,min(x2,e.x)); y=max(y1,min(y2,e.y))
         sx,sy=self._crop_start
         self._crop_pixels=(max(x1,min(sx,x)),max(y1,min(sy,y)),min(x2,max(sx,x)),min(y2,max(sy,y)))
         self.status.set("تم تحديد منطقة القص. اضغط «قص التحديد» لتطبيقها.")
 
+    def _edge_crop_motion(self,e):
+        # مجرد تلميح عند المرور فوق الحافة (لا يعمل أثناء السحب لأن Tk يستدعي B1-Motion وقتها)
+        if getattr(self,"_edge_crop_drag",None):return
+        self._clear_edge_overlay()
+        try:
+            d=self._edge_hit(e)
+            if d:
+                x1,y1,x2,y2=self._canvas_img_rect; m=self._EDGE_MARGIN
+                box={"left":(x1,y1,x1+m,y2),"right":(x2-m,y1,x2,y2),"top":(x1,y1,x2,y1+m),"bottom":(x1,y2-m,x2,y2)}[d]
+                self._edge_crop_rect=self.canvas.create_rectangle(*box,fill=T["accent"],stipple="gray25",outline="")
+                self.canvas.configure(cursor="sb_h_double_arrow" if d in("left","right") else "sb_v_double_arrow")
+            elif not getattr(self,"_crop_start",None):
+                self.canvas.configure(cursor="")
+        except Exception:pass
+
+
     def apply_crop(self):
         if not self.pages:return messagebox.showinfo("تنبيه","امسح صفحة أولاً.")
-        if not hasattr(self,"_crop_pixels"):return messagebox.showinfo("تحديد القص","اضغط «بدء تحديد القص» ثم اسحب على الصورة.")
+        if not hasattr(self,"_crop_pixels"):return messagebox.showinfo("تحديد القص","اضغط «بدء تحديد القص» ثم اسحب على الصورة أو اسحب من حافة الصورة لاقتطاع الهامش.")
         rect=self._canvas_img_rect
         if not rect:return
         x0,y0,x1,y1=self._crop_pixels; rx,ry,_,_=rect
         dispw=max(1,rect[2]-rect[0]); disph=max(1,rect[3]-rect[1])
         # Convert canvas coordinates to normalized page coordinates.
+        page=self.pages[self.current]
         cr=((x0-rx)/dispw,(y0-ry)/disph,(x1-rx)/dispw,(y1-ry)/disph)
-        if cr[2]-cr[0]<.02 or cr[3]-cr[1]<.02:return messagebox.showwarning("قص صغير","حدد مساحة أكبر من ذلك.")
+        cr=(max(0.0,min(1.0,cr[0])),max(0.0,min(1.0,cr[1])),max(0.0,min(1.0,cr[2])),max(0.0,min(1.0,cr[3])))
+        if cr[2]-cr[0]<.01 or cr[3]-cr[1]<.01:return messagebox.showwarning("قص صغير","حدد مساحة أكبر من ذلك.")
+        # الإحداثيات نسبة إلى الصورة المعروضة (المقصوصة سابقًا) → نحوّلها إلى نسبة من الصورة الكاملة
+        bx1,by1,bx2,by2=page.get("crop_norm") or (0.0,0.0,1.0,1.0)
+        cr=(bx1+cr[0]*(bx2-bx1),by1+cr[1]*(by2-by1),bx1+cr[2]*(bx2-bx1),by1+cr[3]*(by2-by1))
         self._push_history()
         page["crop_norm"]=cr
         self._reset_crop_selection()
@@ -2227,8 +3204,8 @@ class App(tk.Tk):
         if self._restoring:return messagebox.showinfo("استعادة الجلسة","انتظر انتهاء استعادة الجلسة السابقة قبل إفراغ الصفحات.")
         if self.working:return messagebox.showinfo("المعالجة جارية","انتظر انتهاء المسح أو التحسين قبل إفراغ الصفحات.")
         if self.pages and messagebox.askyesno("تأكيد","إزالة جميع الصفحات من الجلسة الحالية؟"):
-            self._reset_session_state()
-            self.status.set("تم إفراغ قائمة الصفحات.")
+            if self._reset_session_state():
+                self.status.set("تم إفراغ قائمة الصفحات. الجلسة السابقة محفوظة في «فتح جلسة سابقة».")
 
 def _selftest(out_path):
     """فحص ذاتي يُشغَّل من سكربت البناء: يتأكد أن كل المكتبات والنماذج داخل الحزمة تعمل فعلًا."""

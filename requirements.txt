@@ -1,7 +1,8 @@
 Pillow>=10.0.0
 numpy>=1.24.0
 pywin32>=306; platform_system == "Windows"
-pyinstaller>=6.0.0
+# اختياري: يدعم TWAIN عبر pytwain. برنامج WIA يعمل دون تثبيته.
+# pytwain>=2.3.0; platform_system == "Windows"
 pytesseract>=0.3.10
 PyMuPDF>=1.23.0
 scikit-image>=0.22

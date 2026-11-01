@@ -249,8 +249,16 @@ def _flatten_once(img):
     bg = cv2.medianBlur(bg, 21)
     bg = cv2.GaussianBlur(bg, (0, 0), max(2.0, k / 3.0))
     bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
-    bg = np.maximum(bg, 50)               # تجنّب تضخيم المناطق المظلمة جدًا
-    return cv2.divide(img, bg, scale=255.0)
+    # المناطق السوداء الواسعة (حواف الماسح، كتل الأسود، الإطارات) لا تحتوي ورقًا فيكون تقدير الخلفية
+    # داكنًا. القسمة عليه كانت ترفع الأسود إلى رمادي بألوان باهتة (أحمر/أخضر/أصفر). لذلك نخفّف
+    # التصحيح تدريجيًا كلما أظلم التقدير حتى يصبح صفرًا فيبقى الأسود أسود كما في الأصل.
+    lum = bg.max(axis=2) if bg.ndim == 3 else bg
+    wgt = np.clip((lum.astype(np.float32) - 55.0) / 50.0, 0.0, 1.0)
+    if bg.ndim == 3:
+        wgt = wgt[:, :, None]
+    bg_eff = 255.0 - wgt * (255.0 - bg.astype(np.float32))
+    out = img.astype(np.float32) * 255.0 / np.maximum(bg_eff, 1.0)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 # ----------------------------------------------------------- تصحيح الميلان
@@ -391,6 +399,130 @@ def _white_point(white):
     return int(250 - 0.5 * white)           # white: 0..100
 
 
+def align_channels(img, tile=384, max_shift=3.0, max_tiles=9):
+    """محاذاة قناتي الأحمر والأزرق مع الأخضر (المرجع) بدقة أقل من بكسل.
+
+    السبب الجذري لحواف الألوان: مستشعر الماسح (CIS) يلتقط الأحمر والأخضر والأزرق بإزاحة بسيطة
+    (نصف بكسل إلى بكسل) عن بعضها، فيظهر كل خط أسود رفيع بحافة حمراء/صفراء من جهة وزرقاء/سماوية
+    من الجهة الأخرى. نقدّر الإزاحة (ECC) على مربعات من الصفحة ونطبّق تصحيحًا خطيًا (انسحاب + ميل خفيف)
+    فتعود القنوات الثلاث إلى التطابق وتبقى الألوان الحقيقية (الأختام والشعارات) كما هي."""
+    try:
+        if img is None or img.ndim != 3 or img.shape[2] != 3:
+            return img
+        h, w = img.shape[:2]
+        t = int(min(tile, h // 2, w // 2))
+        if t < 128:
+            return img
+        b, g, r = cv2.split(img)
+        prep = lambda x: cv2.GaussianBlur(x.astype(np.float32), (0, 0), 1.0)
+        gf, chans = prep(g), {0: prep(b), 2: prep(r)}
+        crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 25, 1e-4)
+        ys = np.unique(np.linspace(0, h - t, max(1, int(round(h / float(t))))).astype(int))
+        xs = np.unique(np.linspace(0, w - t, max(1, int(round(w / float(t))))).astype(int))
+        cands = []
+        for y in ys:
+            for x in xs:
+                gt = gf[y:y + t, x:x + t]
+                sd = float(gt.std())
+                if sd >= 6.0 and gt.min() <= 150:         # مربع فيه بنية (خطوط/نص) تكفي للتقدير
+                    cands.append((sd, y, x))
+        cands.sort(reverse=True)
+        pts = {0: [], 2: []}
+        for _sd, y, x in cands[:max_tiles]:               # أغنى المربعات فقط: أسرع بكثير وبنفس الدقة
+            gt = gf[y:y + t, x:x + t]
+            for ci, cf in chans.items():
+                try:
+                    warp = np.eye(2, 3, dtype=np.float32)
+                    cc, warp = cv2.findTransformECC(gt, cf[y:y + t, x:x + t], warp,
+                                                    cv2.MOTION_TRANSLATION, crit, None, 1)
+                except cv2.error:
+                    continue
+                tx, ty = float(warp[0, 2]), float(warp[1, 2])
+                if cc > 0.6 and abs(tx) <= max_shift and abs(ty) <= max_shift:
+                    pts[ci].append((x + t / 2.0, y + t / 2.0, tx, ty, float(cc)))
+        out = [None, g, None]
+        for ci in (0, 2):
+            p = np.array(pts[ci], dtype=np.float64)
+            src = (b if ci == 0 else r)
+            if len(p) == 0:
+                out[ci] = src
+                continue
+            wt = p[:, 4]
+            coef = []
+            for k in (2, 3):                                  # tx ثم ty
+                med = float(np.average(p[:, k], weights=wt))
+                c = np.array([med, 0.0, 0.0])
+                if len(p) >= 6:
+                    A = np.stack([np.ones(len(p)), p[:, 0] / w, p[:, 1] / h], axis=1)
+                    sol, *_ = np.linalg.lstsq(A * wt[:, None], p[:, k] * wt, rcond=None)
+                    corners = np.array([[1, 0, 0], [1, 1, 0], [1, 0, 1], [1, 1, 1]], float) @ sol
+                    if np.all(np.abs(corners) <= max_shift) and abs(sol[1]) < 1.5 and abs(sol[2]) < 1.5:
+                        c = sol
+                coef.append(c)
+            (a0, a1, a2), (b0, b1, b2) = coef
+            if max(abs(a0), abs(b0), abs(a1), abs(a2), abs(b1), abs(b2)) < 0.04:
+                out[ci] = src
+                continue
+            M = np.float32([[1 + a1 / w, a2 / h, a0], [b1 / w, 1 + b2 / h, b0]])
+            out[ci] = cv2.warpAffine(src, M, (w, h), flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+                                     borderMode=cv2.BORDER_REPLICATE)
+        return cv2.merge(out)
+    except Exception:
+        return img
+
+
+def _neutral_ink(img):
+    """ما بقي من شوائب ملونة بعد المحاذاة (بكسل واحد حول الحبر الأسود) يُحوَّل إلى رمادي
+    اعتمادًا على قناة الأخضر المرجعية. الحبر الأسود = كل القنوات داكنة، لذلك لا يمسّ الأزرق
+    الساطع للأختام ولا ألوان الشعارات."""
+    try:
+        b, g, r = cv2.split(img)
+        mx = np.maximum(np.maximum(b, g), r)
+        core = (mx < 90).astype(np.uint8)
+        if not core.any():
+            return img
+        zone = cv2.dilate(core, np.ones((3, 3), np.uint8)) > 0
+        chroma = mx.astype(np.int16) - np.minimum(np.minimum(b, g), r).astype(np.int16)
+        fix = zone & (chroma > 12)
+        if not fix.any():
+            return img
+        out = img.copy()
+        out[fix] = g[fix][:, None]
+        return out
+    except Exception:
+        return img
+
+
+def _kill_fringes(img, chroma_min=12, ink_level=150, reach=2):
+    """يحذف أي لون رفيع (بكسل أو بكسلان) ملاصق للحبر الداكن ويجعله رماديًا بحسب قناة الأخضر المرجعية.
+
+    الفكرة: الحواف الملونة (أحمر/أصفر/أزرق/سماوي/بنفسجي) حول الخطوط والنصوص السوداء رقيقة دائمًا
+    (≤ 2 بكسل)، أما الألوان الحقيقية (الأختام، الشعارات، الحبر الملوّن) فتشكّل مساحات أسمك.
+    نبني قناع «اللون السميك» بعملية فتح مورفولوجي (opening) ونحميه، ونحوّل كل لون رفيع قريب
+    من الحبر إلى رمادي فيصير الأسود أسود فقط."""
+    try:
+        b, g, r = cv2.split(img)
+        mx = np.maximum(np.maximum(b, g), r)
+        chroma = mx.astype(np.int16) - np.minimum(np.minimum(b, g), r).astype(np.int16)
+        y = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ink = (y < ink_level).astype(np.uint8)
+        if not ink.any():
+            return img
+        k = 2 * reach + 1
+        near = cv2.dilate(ink, np.ones((k, k), np.uint8)) > 0
+        colored = (chroma > 35).astype(np.uint8)
+        solid = cv2.morphologyEx(colored, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        protect = cv2.dilate(solid, np.ones((3, 3), np.uint8)) > 0
+        fix = near & (chroma > chroma_min) & ~protect
+        if not fix.any():
+            return img
+        out = img.copy()
+        out[fix] = g[fix][:, None]
+        return out
+    except Exception:
+        return img
+
+
 def _defringe(img):
     """إزالة حواف الألوان الرفيعة (أحمر/أخضر) حول الخطوط السوداء.
 
@@ -424,6 +556,8 @@ def _defringe(img):
 def _magic_color(img, ink, white, defringe=True):
     # إزالة شوائب الألوان *قبل* توحيد التباين، لأن التوحيد نفس�� يزيد إشباعها.
     if defringe:
+        img = _neutral_ink(img)
+        img = _kill_fringes(img)
         img = _defringe(img)
     img = cv2.LUT(img, _lut(25, _white_point(white), 1.12 + 0.08 * ink))
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -432,9 +566,13 @@ def _magic_color(img, ink, white, defringe=True):
     sat = hsv[:, :, 1].astype(np.float32)
     val = hsv[:, :, 2].astype(np.float32)
     factor = 0.30 + 0.95 * np.clip((val - 70.0) / 90.0, 0.0, 1.0)
+    factor *= 0.15 + 0.85 * np.clip((val - 25.0) / 45.0, 0.0, 1.0)   # الأسود الحقيقي يبقى محايدًا
     hsv[:, :, 1] = np.clip(sat * factor, 0, 255).astype(np.uint8)
     img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    return _unsharp(img, 0.8, 1.0)
+    img = _unsharp(img, 0.8, 1.0)
+    if defringe:
+        img = _kill_fringes(img)               # شبكة أمان أخيرة بعد التباين والتحديد
+    return img
 
 
 def _clean_gray(g, ink, white):
@@ -507,6 +645,8 @@ def process(img_bgr, mode="magic", crop=True, deskew=True, shadows=True,
     """
     note = ""
     img = img_bgr
+    if defringe and mode != "original":
+        img = align_channels(img)          # يزيل جذر حواف الألوان قبل أي معالجة أخرى
     if crop:
         img = crop_page(img)
     if trim:

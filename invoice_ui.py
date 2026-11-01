@@ -172,6 +172,8 @@ class InvoiceDialog(tk.Toplevel):
         self.nav_lbl.pack(side="left", padx=6)
         self.btn_prev = ui.IconBtn(row, "prev", lambda: self.go(-1), tip="الفاتورة السابقة", bg_token="surface", variant="secondary")
         self.btn_prev.pack(side="left")
+        ui.Btn(row, "معلومات المطوّر", lambda: ui.show_developer_info(self), icon="doc",
+               height=36, fill_x=False, variant="ghost", bg_token="surface").pack(side="left", padx=(12, 0))
         ui.HSep(hdr).pack(fill="x")
 
         foot = ui.Themed(self, "surface")
@@ -410,6 +412,13 @@ class InvoiceDialog(tk.Toplevel):
         win.title("النص المقروء (OCR)")
         win.geometry("720x560")
         win.configure(bg=T["bg"])
+        foot = ui.Themed(win, "surface")
+        foot.pack(side="bottom", fill="x")
+        ui.HSep(foot).pack(fill="x")
+        frow = ui.Themed(foot, "surface")
+        frow.pack(fill="x", padx=12, pady=8)
+        ui.Btn(frow, "معلومات المطوّر", lambda: ui.show_developer_info(self), icon="doc",
+               height=32, fill_x=False, font="small_b").pack(side="right")
         t = tk.Text(win, wrap="word", font=ui.F("body"), bg=T["surface"], fg=T["fg"], bd=0, padx=12, pady=10)
         t.pack(fill="both", expand=True)
         t.insert("1.0", self.cur.get("text") or "(لا يوجد نص محفوظ)")
@@ -489,5 +498,7 @@ class InvoiceDialog(tk.Toplevel):
         row.pack(fill="x", side="bottom")
         ui.Btn(row, "إرسال", ok, variant="primary", height=40, fill_x=False).pack(side="right")
         ui.Btn(row, "إلغاء", win.destroy, height=40, fill_x=False).pack(side="right", padx=8)
+        ui.Btn(row, "معلومات المطوّر", lambda: ui.show_developer_info(win), icon="doc",
+               height=40, fill_x=False, font="small_b").pack(side="left")
         self.wait_window(win)
         return out.get("v")

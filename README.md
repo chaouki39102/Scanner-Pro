@@ -8,6 +8,13 @@ Application de bureau Windows pour numériser, améliorer et extraire des factur
 
 [العربية](#العربية) · [English](#english) · [Français](#français)
 
+**المطوّر / Developer / Auteur :** عبد الصادق شوقي — Abdessadok Chaouki
+
+- **الهاتف وواتساب / Phone & WhatsApp / Téléphone et WhatsApp :** [+213667574666](tel:+213667574666)
+- **البريد الإلكتروني / Email / E-mail :** [abdessadokchaouki@gmail.com](mailto:abdessadokchaouki@gmail.com)
+
+![Canon Scan Pro](SCREEN.png)
+
 ---
 
 ## العربية

@@ -14,10 +14,12 @@ VSVersionInfo(
     StringFileInfo([
       StringTable(
         '040904B0',
-        [StringStruct('CompanyName', 'Canon Scan Pro'),
+        [StringStruct('CompanyName', 'Abdessadok Chaouki'),
          StringStruct('FileDescription', 'Canon Scan Pro - Document scanning and enhancement'),
          StringStruct('FileVersion', '7.3.0.0'),
          StringStruct('InternalName', 'CanonScanPro'),
+         StringStruct('LegalCopyright', 'Copyright (C) 2026 Abdessadok Chaouki'),
+         StringStruct('Comments', 'Developer: Abdessadok Chaouki - Email: abdessadokchaouki@gmail.com - Phone/WhatsApp: +213667574666'),
          StringStruct('OriginalFilename', 'CanonScanPro.exe'),
          StringStruct('ProductName', 'Canon Scan Pro'),
          StringStruct('ProductVersion', '7.3.0.0')])

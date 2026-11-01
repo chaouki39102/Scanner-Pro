@@ -9,7 +9,7 @@ datas = [
 ]
 binaries = []
 hiddenimports = ['win32com.client', 'pythoncom', 'pywintypes', 'win32timezone',
-                 'scan_enhance', 'ui_theme', 'app_icon', 'extras', 'invoice_extract', 'invoice_ui', 'openpyxl', 'pytesseract', 'winreg',
+                 'scan_enhance', 'scanner_backend', 'ui_theme', 'app_icon', 'extras', 'invoice_extract', 'invoice_ui', 'openpyxl', 'pytesseract', 'winreg',
                  'rapidocr', 'rapidocr_onnxruntime', 'onnxruntime', 'pyclipper', 'shapely']
 
 for pkg in ('cv2', 'PIL', 'skimage', 'scipy', 'pywt', 'pymupdf', 'fitz',

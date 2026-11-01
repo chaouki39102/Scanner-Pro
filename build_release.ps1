@@ -42,6 +42,8 @@ try {
     $vpy = (Resolve-Path '.venv-build\Scripts\python.exe').Path
     Run $vpy @('-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--upgrade', 'pip')
     Run $vpy @('-m', 'pip', 'install', '-q', '--disable-pip-version-check', '-r', 'requirements.txt')
+    # PyInstaller is required only on the build machine, not on the client.
+    Run $vpy @('-m', 'pip', 'install', '-q', '--disable-pip-version-check', 'pyinstaller>=6.0.0')
     # RapidOCR's dependency (opencv-python) can overwrite opencv-contrib-python.
     # Reinstall contrib last so dnn_superres (AI upscaling) keeps working.
     Run $vpy @('-m', 'pip', 'install', '-q', '--disable-pip-version-check', '--force-reinstall', '--no-deps', 'opencv-contrib-python>=4.8.0')

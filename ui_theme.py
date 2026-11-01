@@ -947,3 +947,90 @@ def shadow_image(w, h, blur=12, alpha=90, color=None):
     if s != 1.0:
         im = im.resize((w + int(pad * 2 / s), h + int(pad * 2 / s)), Image.BILINEAR)
     return ImageTk.PhotoImage(im), (int(pad / s) if s != 1.0 else pad)
+
+
+# =========================================================== معلومات المطوّر
+DEVELOPER_NAME_AR = "عبد الصادق شوقي"
+DEVELOPER_NAME = "Abdessadok Chaouki"
+DEVELOPER_PHONE = "+213667574666"
+DEVELOPER_EMAIL = "abdessadokchaouki@gmail.com"
+
+
+def show_developer_info(parent, app_name="Canon Scan Pro", version=""):
+    """نافذة موحّدة تعرض بيانات المطوّر ويمكن فتحها من أي واجهة."""
+    win = tk.Toplevel(parent)
+    win.title("معلومات المطوّر")
+    win.configure(bg=T["bg"])
+    try:
+        win.transient(parent.winfo_toplevel())
+    except Exception:
+        pass
+    win.resizable(False, False)
+    try:
+        root = parent.winfo_toplevel()
+        win.geometry(f"+{root.winfo_rootx() + 160}+{root.winfo_rooty() + 140}")
+    except Exception:
+        pass
+
+    prev_grab = None
+    try:
+        prev_grab = parent.grab_current()
+    except Exception:
+        pass
+
+    def close():
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        if prev_grab is not None:
+            try:
+                prev_grab.grab_set()
+            except Exception:
+                pass
+        win.destroy()
+
+    def copy(value):
+        try:
+            win.clipboard_clear()
+            win.clipboard_append(value)
+            win.update_idletasks()
+        except Exception:
+            pass
+        try:
+            status = getattr(parent, "status", None)
+            if status is not None:
+                status.set("تم نسخ بيانات التواصل إلى الحافظة.")
+        except Exception:
+            pass
+
+    wrap = Themed(win, "bg")
+    wrap.pack(fill="both", expand=True, padx=22, pady=18)
+    label(wrap, app_name, "h1", "fg", "bg", anchor="e").pack(fill="x")
+    if version:
+        label(wrap, f"الإصدار {version}", "small", "muted", "bg", anchor="e").pack(fill="x")
+    HSep(wrap).pack(fill="x", pady=12)
+    label(wrap, "المطوّر", "small", "fg2", "bg", anchor="e").pack(fill="x")
+    label(wrap, f"{DEVELOPER_NAME_AR} — {DEVELOPER_NAME}", "body_b", "fg", "bg", anchor="e").pack(fill="x", pady=(2, 10))
+    for title, value in (("الهاتف / واتساب", DEVELOPER_PHONE), ("البريد الإلكتروني", DEVELOPER_EMAIL)):
+        label(wrap, title, "small", "fg2", "bg", anchor="e").pack(fill="x")
+        row = Themed(wrap, "bg")
+        row.pack(fill="x", pady=(2, 8))
+        ent = tk.Entry(row, font=F("body_b"), justify="left", relief="flat", bd=0,
+                       bg=T["surface"], fg=T["fg"], insertbackground=T["fg"], highlightthickness=1,
+                       highlightbackground=T["border"], highlightcolor=T["border"])
+        ent.insert(0, value)
+        ent.configure(state="readonly")
+        ent.pack(side="right", fill="x", expand=True, ipady=5)
+        Btn(row, "نسخ", lambda v=value: copy(v), height=32, pad=8, font="small_b",
+            variant="soft").pack(side="left", padx=(8, 0))
+    label(wrap, "للاستفسار والدعم والاقتراحات.", "small", "muted", "bg", anchor="e").pack(fill="x", pady=(4, 10))
+    Btn(wrap, "إغلاق", close, variant="primary", height=38).pack(fill="x")
+    win.protocol("WM_DELETE_WINDOW", close)
+    try:
+        if prev_grab is not None:
+            win.grab_set()
+        win.focus_set()
+    except Exception:
+        pass
+    return win
