@@ -445,6 +445,241 @@ class EmptyState(tk.Canvas):
         self.create_window(24, top, window=self.browser, width=w - 48,
                            height=max(160, h - top - 14), anchor="nw")
 
+class PageActionsMenu(tk.Toplevel):
+    """قائمة إجراءات الصفحة بنمط حديث: بطاقة مستديرة، أيقونات، شبكة، وتأثير hover."""
+
+    PAD = 14
+    CARD_W = 360
+    HEADER_H = 54
+    COLS = 4
+    TILE_H = 72
+    DANGER_H = 44
+
+    def __init__(self, app, index, x, y):
+        super().__init__(app)
+        self.app, self.index = app, index
+        self._photo_refs = []
+        self._icon_cache = {}
+        self._tiles = []
+        self._hover = None
+        self.overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+        self._key = T["canvas"]
+        try:
+            self.configure(bg=self._key)
+            self.wm_attributes("-transparentcolor", self._key)
+        except Exception:
+            self._key = None
+            self.configure(bg=T["surface"])
+        self._build()
+        self._place(x, y)
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except Exception:
+            pass
+        self._place(x, y)
+        self.update_idletasks()
+        self.bind("<Escape>", lambda _e: self.close())
+
+    def _icon(self, name, size, color):
+        key = (name, size, color)
+        photo = self._icon_cache.get(key)
+        if photo is None:
+            photo = ui.icon_image(name, size, color)
+            self._icon_cache[key] = photo
+            self._photo_refs.append(photo)
+        return photo
+
+    def _specs(self):
+        app, index = self.app, self.index
+        pages = app.pages
+        ready = not app.working
+        return [
+            ("eye", "الأصل", app.toggle_original, ready),
+            ("wand", "تحسين", app.reprocess, ready),
+            ("image", "تصدير صورة", app.export_image, ready),
+            ("pdf", "PDF", lambda: app.save_pdf(current_only=True), ready),
+            ("print", "طباعة", lambda: app.print_pages(current_only=True), ready),
+            ("rot_right", "تدوير يمين", lambda: app.rotate_degrees(-90), ready),
+            ("rot_left", "تدوير يسار", lambda: app.rotate_degrees(90), ready),
+            ("crop", "قص", app.start_crop, ready),
+            ("prev", "نقل يمين", lambda: app._move_page(-1), ready and index > 0),
+            ("next", "نقل يسار", lambda: app._move_page(1), ready and index < len(pages) - 1),
+            ("layers", "PDF للكل", app.save_pdf, ready and len(pages) > 0),
+            ("print", "طباعة الكل", app.print_pages, ready and len(pages) > 0),
+        ]
+
+    def _build(self):
+        specs = self._specs()
+        rows = (len(specs) + self.COLS - 1) // self.COLS
+        card_h = self.HEADER_H + rows * self.TILE_H + 10 + self.DANGER_H + 12
+        self.card_h = card_h
+        width, height = self.CARD_W + self.PAD * 2, card_h + self.PAD * 2
+        bg = self._key if self._key else T["surface"]
+        self.canvas = tk.Canvas(self, width=width, height=height, bg=bg,
+                                highlightthickness=0, bd=0, cursor="arrow")
+        self.canvas.pack()
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Escape>", lambda _e: self.close())
+
+        card = ui.rr_image(self.CARD_W, card_h, 16, T["surface"], T["border"], 1)
+        self._photo_refs.append(card)
+        self.canvas.create_image(self.PAD, self.PAD, image=card, anchor="nw")
+        right = self.PAD + self.CARD_W
+
+        inner = 18
+        cell_w = (self.CARD_W - inner * 2) / float(self.COLS)
+        tile_w, tile_h = int(cell_w) - 8, self.TILE_H - 8
+        grid_top = self.PAD + self.HEADER_H
+        self._grid_hover = self.canvas.create_image(0, 0, anchor="nw", state="hidden",
+            image=self._hover_image(tile_w, tile_h, T["hover"]))
+        self._danger_hover = self.canvas.create_image(0, 0, anchor="nw", state="hidden",
+            image=self._hover_image(self.CARD_W - 24, self.DANGER_H, T["danger_soft"]))
+
+        bar = ui.rr_image(4, 30, 2, T["accent"])
+        self._photo_refs.append(bar)
+        self.canvas.create_image(right - 12, self.PAD + 12, image=bar, anchor="nw")
+        self.canvas.create_text(right - 24, self.PAD + 16, text="خيارات الصفحة", anchor="ne",
+                                fill=T["fg"], font=ui.F("h3"))
+        self.canvas.create_text(right - 24, self.PAD + 36,
+                                text=f"الصفحة {self.index + 1} من {len(self.app.pages)}",
+                                anchor="ne", fill=T["muted"], font=ui.F("small"))
+
+        self.canvas.create_oval(self.PAD + 12, self.PAD + 12, self.PAD + 40, self.PAD + 40,
+                                fill=T["surface2"], outline="")
+        self.canvas.create_image(self.PAD + 26, self.PAD + 26, image=self._icon("clear", 14, T["muted"]))
+
+        line_y = self.PAD + self.HEADER_H - 8
+        self.canvas.create_line(self.PAD + 14, line_y, right - 14, line_y, fill=T["border"])
+
+        for i, (icon, label, command, enabled) in enumerate(specs):
+            col, row = i % self.COLS, i // self.COLS
+            cell_right = self.PAD + self.CARD_W - inner - col * cell_w
+            x = int(round(cell_right - cell_w + 4))
+            y = grid_top + row * self.TILE_H + 4
+            color = T["fg2"] if enabled else T["muted"]
+            icon_normal = self._icon(icon, 22, color)
+            icon_hover = self._icon(icon, 22, T["accent"] if enabled else color)
+            cx = x + tile_w / 2.0
+            icon_item = self.canvas.create_image(cx, y + 22, image=icon_normal)
+            label_item = self.canvas.create_text(cx, y + tile_h - 14, text=label, fill=color,
+                                                 font=ui.F("small"), width=tile_w, justify="center")
+            self._tiles.append(dict(kind="tile", x=x, y=y, w=tile_w, h=tile_h,
+                                    icon_item=icon_item, label_item=label_item,
+                                    icon_normal=icon_normal, icon_hover=icon_hover,
+                                    command=command, enabled=enabled, color=color))
+
+        danger_y = grid_top + rows * self.TILE_H + 10
+        self.canvas.create_line(self.PAD + 14, danger_y - 6, right - 14, danger_y - 6,
+                                fill=T["border"])
+        enabled = not self.app.working
+        danger = T["danger"] if enabled else T["muted"]
+        danger_icon = self._icon("trash", 20, danger)
+        danger_icon_hover = self._icon("trash", 20, T["danger"] if enabled else danger)
+        danger_icon_item = self.canvas.create_image(right - 40, danger_y + self.DANGER_H / 2,
+                                                    image=danger_icon)
+        danger_label_item = self.canvas.create_text(right - 58, danger_y + self.DANGER_H / 2,
+                                                    text="حذف هذه الصفحة", anchor="e", fill=danger,
+                                                    font=ui.F("body_b"))
+        self._tiles.append(dict(kind="danger", x=self.PAD + 12, y=danger_y,
+                                w=self.CARD_W - 24, h=self.DANGER_H,
+                                icon_item=danger_icon_item, label_item=danger_label_item,
+                                icon_normal=danger_icon, icon_hover=danger_icon_hover,
+                                command=self.app.delete_page, enabled=enabled, color=danger))
+
+    def _hover_image(self, w, h, color):
+        photo = ui.rr_image(int(w), int(h), 12, color)
+        self._photo_refs.append(photo)
+        return photo
+
+    @staticmethod
+    def _inside(tile, x, y):
+        return tile["x"] <= x <= tile["x"] + tile["w"] and tile["y"] <= y <= tile["y"] + tile["h"]
+
+    def _hit(self, x, y):
+        for tile in self._tiles:
+            if self._inside(tile, x, y):
+                return tile
+        return None
+
+    def _set_hover(self, tile):
+        if tile is self._hover:
+            return
+        self._hover = tile
+        self.canvas.itemconfigure(self._grid_hover, state="hidden")
+        self.canvas.itemconfigure(self._danger_hover, state="hidden")
+        for item in self._tiles:
+            active = item is tile and item.get("enabled", True)
+            self.canvas.itemconfigure(item["icon_item"],
+                                      image=item.get("icon_hover", item["icon_normal"]) if active else item["icon_normal"])
+            self.canvas.itemconfigure(item["label_item"],
+                                      fill=T["accent"] if active and item["kind"] == "tile" else item["color"])
+        if tile is None:
+            self.canvas.configure(cursor="arrow")
+            return
+        self.canvas.configure(cursor="hand2" if tile.get("enabled", True) else "arrow")
+        hover = self._danger_hover if tile["kind"] == "danger" else self._grid_hover
+        self.canvas.coords(hover, tile["x"], tile["y"])
+        self.canvas.itemconfigure(hover, state="normal")
+
+    def _on_motion(self, event):
+        tile = self._hit(event.x, event.y)
+        if tile is not None and not tile.get("enabled", True):
+            tile = None
+        self._set_hover(tile)
+
+    def _on_leave(self, _event):
+        self._set_hover(None)
+
+    def _on_click(self, event):
+        if self.PAD + 10 <= event.x <= self.PAD + 42 and self.PAD + 10 <= event.y <= self.PAD + 42:
+            self.close()
+            return
+        tile = self._hit(event.x, event.y)
+        if tile is None:
+            if not (self.PAD <= event.x <= self.PAD + self.CARD_W and
+                    self.PAD <= event.y <= self.PAD + self.card_h):
+                self.close()
+            return
+        if not tile.get("enabled", True):
+            return
+        command = tile["command"]
+        self.close()
+        try:
+            command()
+        except Exception:
+            traceback.print_exc()
+
+    def _place(self, x, y):
+        self.update_idletasks()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        left = max(8, min(int(x - w / 2.0), sw - w - 8))
+        top = int(y + 10)
+        if top + h > sh - 8:
+            top = max(8, int(y - h - 10))
+        self.geometry(f"{w}x{h}+{left}+{top}")
+
+    def close(self):
+        if getattr(self.app, "_thumb_menu", None) is self:
+            self.app._thumb_menu = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
 class App(tk.Tk):
     # >>> __init__
     def __init__(self):
@@ -1250,9 +1485,9 @@ class App(tk.Tk):
             txt=f"{idx+1}"+("  •" if page.get("processing") else "")
             cv.create_text(TW//2,TH-15,text=txt,fill=T["accent_soft_fg"] if sel else T["fg2"],font=ui.F("small_b"))
             cv.bind("<Button-1>",lambda e,i=idx:self._select_thumbnail(i))
-            cv.bind("<ButtonPress-3>",lambda e,i=idx:self._thumb_drag_start(i))
+            cv.bind("<ButtonPress-3>",lambda e,i=idx:self._thumb_drag_start(i,e))
             cv.bind("<B3-Motion>",self._thumb_drag_motion)
-            cv.bind("<ButtonRelease-3>",self._thumb_drag_end)
+            cv.bind("<ButtonRelease-3>",lambda e,i=idx:self._thumb_release(i,e))
             cv.pack(side="right",padx=4,pady=0)
         self.thumb_inner.update_idletasks(); self._layout_thumbs()
         if self.pages:
@@ -1340,7 +1575,13 @@ class App(tk.Tk):
                     self._post_ui(publish)
                     # Wait until Tk has painted the original preview before CPU-heavy work.
                     published.wait(timeout=5)
-                    self._process_page(page,st)
+                    try:
+                        self._process_page(page,st)
+                    except Exception as exc:
+                        # صفحة واحدة فاشلة لا تُوقف بقية صفحات المسح.
+                        traceback.print_exc()
+                        page["processing"]=False
+                        page["note"]="تعذّر تحسين هذه الصفحة: "+str(exc)[:300]
                     processed=threading.Event()
                     def finish(p=page,last=final,done=processed):
                         try:self._page_processed(p,final=last)
@@ -1491,32 +1732,43 @@ class App(tk.Tk):
         threading.Thread(target=worker,daemon=True).start()
 
     def reprocess_all(self):
-        """تطبيق الإعدادات الحالية على كل الصفحات دفعة واحدة."""
+        """تطبيق الإعدادات الحالية على كل الصفحات، مع تخطي الصفحات الفاشلة وإبلاغ المستخدم بها."""
         if self.working:return
         if not self.pages:return messagebox.showinfo("تنبيه","امسح صفحة واحدة على الأقل.")
         st=self._settings(); pages=list(self.pages)
         self._set_busy(True,f"جارٍ تطبيق التحسينات على {len(pages)} صفحة…")
         def worker():
-            done=[]
-            try:
-                for index,page in enumerate(pages):
+            done=[]; failed=[]
+            for index,page in enumerate(pages):
+                page["processing"]=True
+                try:
                     self._process_page(page,st)
                     done.append((page,index))
-                    self._post_ui(lambda i=index,p=len(pages): self.status.set(f"جارٍ المعالجة… {i+1} من {p}"))
-                self._post_ui(lambda:self._pages_ready(done))
-            except Exception as e:
-                msg=str(e); self._post_ui(lambda:self._fail("فشلت المعالجة: "+msg))
+                except Exception as e:
+                    failed.append((page,index,str(e) or e.__class__.__name__))
+                self._post_ui(lambda i=index,p=len(pages): self.status.set(f"جارٍ المعالجة… {i+1} من {p}"))
+            self._post_ui(lambda:self._pages_ready(done,failed))
         threading.Thread(target=worker,daemon=True).start()
 
-    def _pages_ready(self,done):
+    def _pages_ready(self,done,failed=None):
+        failed=list(failed or [])
         self._set_busy(False)
         for page,_index in done:
             page["processing"]=False
+        for page,index,error in failed:
+            page["processing"]=False
+            page["note"]="تعذّر تحسين هذه الصفحة: "+str(error)[:300]
         self.show_original=False; self.compare_mode.set(False); self.show_page()
         self._refresh_thumbnails(); self._schedule_estimate(); self._save_session()
         if done:
             w,h=done[-1][0]["img"].size
             self.status.set(f"تم تطبيق التحسينات على {len(done)} صفحة | الحجم النهائي {w:,} × {h:,} بكسل")
+        if failed:
+            nums="، ".join(str(index+1) for _page,index,_error in failed)
+            self.status.set(f"تم تحسين {len(done)} صفحة، وتعذّرت {len(failed)} صفحة: {nums}")
+            details="\n".join(f"• الصفحة {index+1}: {str(error)[:200]}" for _page,index,error in failed)
+            messagebox.showwarning("التحسين",
+                f"اكتمل تحسين {len(done)} صفحة، وتعذّرت الصفحات التالية (بقيت نسختها الأصلية):\n{nums}\n\n{details}")
 
     def _page_ready(self,page,is_new):
         try:
@@ -1663,10 +1915,29 @@ class App(tk.Tk):
         self.current=index; self.show_original=False; self.compare_mode.set(False)
         self._reset_crop_selection(); self.show_page(); self._schedule_estimate()
 
-    def _thumb_drag_start(self,index): self._drag_thumb=index
+    def _thumb_drag_start(self,index,event=None):
+        self._drag_thumb=index
+        self._thumb_moved=False
+        self._thumb_press_xy=(event.x_root,event.y_root) if event is not None else None
+
     def _thumb_drag_motion(self,event):
-        if self._drag_thumb is not None:
-            self.status.set("اسحب بزر الفأرة الأيمن ثم أفلت فوق شريط الصفحات لإعادة الترتيب.")
+        if self._drag_thumb is None:return
+        px,py=getattr(self,"_thumb_press_xy",None) or (event.x_root,event.y_root)
+        if abs(event.x_root-px)+abs(event.y_root-py)>6:
+            self._thumb_moved=True
+        if getattr(self,"_thumb_moved",False):
+            self.status.set("اسحب ثم أفلت لإعادة الترتيب، أو انقر مرة قصيرة لفتح قائمة الصفحة.")
+
+    def _thumb_release(self,index,event):
+        if self._drag_thumb is None:return
+        if getattr(self,"_thumb_moved",False):
+            self._thumb_drag_end(event)
+        else:
+            self._drag_thumb=None
+            x,y=event.x_root,event.y_root
+            try:self.after_idle(lambda i=index,px=x,py=y:self._thumb_context_menu(i,px,py))
+            except Exception:pass
+
     def _thumb_drag_end(self,event):
         if self._drag_thumb is None:return
         try:
@@ -1681,6 +1952,34 @@ class App(tk.Tk):
                 elif target<=self.current<src:self.current+=1
                 self.show_page(); self._save_session(); self.status.set("تم تغيير ترتيب الصفحات.")
         finally:self._drag_thumb=None
+
+    def _thumb_context_menu(self,index,x,y):
+        """قائمة سياق حديثة للصفحة: عرض، تحسين، تصدير، طباعة، تدوير، قص، ترتيب وحذف."""
+        if not (0<=index<len(self.pages)):return
+        self._select_thumbnail(index)
+        old=getattr(self,"_thumb_menu",None)
+        if old is not None:
+            try:old.close()
+            except Exception:
+                try:old.destroy()
+                except Exception:pass
+        try:
+            self._thumb_menu=PageActionsMenu(self,index,x,y)
+        except Exception:
+            self._thumb_menu=None
+            traceback.print_exc()
+            self.status.set("تعذّر فتح قائمة الصفحة.")
+
+    def _move_page(self,delta):
+        """نقل الصفحة الحالية خطوة واحدة (delta=-1 يمينًا، +1 يسارًا في عرض RTL)."""
+        if self.working:return messagebox.showinfo("المعالجة جارية","انتظر انتهاء العملية الحالية.")
+        if not self.pages:return
+        src=self.current; target=src+delta
+        if not (0<=target<len(self.pages)):return
+        page=self.pages.pop(src); self.pages.insert(target,page)
+        self.current=target
+        self.show_page(); self._save_session()
+        self.status.set(f"تم نقل الصفحة إلى الموضع {target+1}.")
 
     def toggle_compare(self):
         if not self.pages:return
@@ -2673,17 +2972,18 @@ class App(tk.Tk):
             self.status.set(f"تم تصدير {len(images)} صفحة إلى TIFF متعدد الصفحات ({self._human(os.path.getsize(p))}): {p}")
         except Exception as e:messagebox.showerror("تعذر حفظ TIFF",str(e))
 
-    def print_pages(self):
-        """تجهيز PDF مؤقت ثم إرساله إلى الطابعة الافتراضية."""
+    def print_pages(self,current_only=False):
+        """تجهيز PDF مؤقت ثم إرساله إلى الطابعة الافتراضية (صفحة واحدة أو الكل)."""
         if self.working:return messagebox.showinfo("المعالجة جارية","انتظر انتهاء التحسين قبل الطباعة.")
         if not self.pages:return messagebox.showinfo("تنبيه","امسح صفحة واحدة على الأقل.")
         if not hasattr(os,"startfile"):
             return messagebox.showinfo("الطباعة","الطباعة المباشرة متاحة على Windows فقط. استخدم تصدير PDF ثم اطبعه.")
+        pages=[self.pages[self.current]] if current_only else list(self.pages)
         tmp=os.path.join(tempfile.gettempdir(),f"csp_print_{datetime.now():%Y%m%d_%H%M%S}.pdf")
         try:
-            self._export_pdf(tmp)
+            self._export_pdf(tmp,pages)
             os.startfile(tmp,"print")
-            self.status.set("تم إرسال المستند إلى قائمة الطباعة. راجع إعدادات الطابعة ثم وافق على الطباعة.")
+            self.status.set(f"تم إرسال {len(pages)} صفحة إلى قائمة الطباعة. راجع إعدادات الطابعة ثم وافق على الطباعة.")
         except Exception as e:
             messagebox.showerror("تعذر الطباعة",f"{e}\n\nالملف المؤقت موجود في:\n{tmp}")
 

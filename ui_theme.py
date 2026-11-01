@@ -268,6 +268,11 @@ def icon_image(name, size, color):
         _line(d, P((12, 15), (12, 3)), w, col)
         _line(d, P((7, 8), (12, 3), (17, 8)), w, col)
         _line(d, P((4, 14), (4, 20), (20, 20), (20, 14)), w, col)
+    elif name == "print":
+        _line(d, P((7, 8), (7, 3), (17, 3), (17, 8)), w, col)
+        rect(3, 8, 21, 17, 2)
+        _line(d, P((7, 17), (7, 21), (17, 21), (17, 17)), w, col)
+        _line(d, P((9.5, 13), (14.5, 13)), w, col)
     elif name in ("rotate", "rot_right", "rot_left"):
         arc(12, 12, 8, 30, 320)
         _line(d, P((18, 3), (18, 8), (13, 8)), w, col)
