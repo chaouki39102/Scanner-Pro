@@ -79,7 +79,7 @@
  [],
  False,
  False,
- 1793446340,
+ 1793608300,
  [('runw.exe',
    'C:\\Users\\PC\\Downloads\\CanonScanPro_Merged\\.venv-build\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

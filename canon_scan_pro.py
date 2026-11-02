@@ -1674,6 +1674,8 @@ class App(tk.Tk):
         return im
 
     def _process_page(self,page,st):
+        page["_cache_ok"]=False
+        page.pop("_cache_files",None); page.pop("_cache_src",None)
         try:
             path=page.get("path")
             if not path or not os.path.isfile(path):
@@ -1868,6 +1870,8 @@ class App(tk.Tk):
             if key in ("img","preview") and value is not None:value=value.copy()
             elif key=="settings" and value is not None:value=dict(value)
             page[key]=value
+        page["_cache_ok"]=False
+        page.pop("_cache_files",None); page.pop("_cache_src",None)
         # إعادة توليد المعاينة الأصلية من الملف الأصلي (بدل تخزينها)
         if page.get("path"):
             try:page["orig_preview"]=se.original_preview(page["path"],page.get("rot",0))
@@ -2015,9 +2019,66 @@ class App(tk.Tk):
         try:names=os.listdir(d)
         except OSError:return
         for n in names:
-            if n.startswith("page_") or n.startswith(".tmp_") or n in ("session.json","session.tmp"):
+            if n.startswith(("page_","enh_","origprev_",".tmp_")) or n in ("session.json","session.tmp"):
                 try:os.remove(os.path.join(d,n))
                 except Exception:pass
+
+    @staticmethod
+    def _resolve_session_file(item,key,base):
+        """يجد ملفًا مساعدًا (معاينة/نسخة محسّنة) بجانب session.json."""
+        name=item.get(key) if isinstance(item,dict) else None
+        if not name:return None
+        p=os.path.join(base,os.path.basename(name))
+        return p if os.path.isfile(p) else None
+
+    @staticmethod
+    def _copy_session_file(src,dst):
+        if not src or not os.path.isfile(src):return False
+        try:
+            if os.path.normcase(os.path.abspath(src))==os.path.normcase(os.path.abspath(dst)):return True
+            tmp=dst+".tmp_"+uuid.uuid4().hex
+            shutil.copy2(src,tmp); os.replace(tmp,dst)
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _save_session_image(self,im,path,fmt,**options):
+        tmp=os.path.join(self._session_dir,f".tmp_{uuid.uuid4().hex}{os.path.splitext(path)[1]}")
+        try:
+            im.save(tmp,format=fmt,**options)
+            os.replace(tmp,path)
+        finally:
+            try:
+                if os.path.isfile(tmp):os.remove(tmp)
+            except OSError:
+                pass
+
+    def _ensure_page_cache(self,page,enh_name,orig_name):
+        """يحفظ نتيجة الفلتر والمعاينة الأصلية داخل الجلسة ويعيد أسماء الملفات."""
+        img=page.get("img"); orig=page.get("orig_preview")
+        if img is None or orig is None:return None
+        names=(enh_name,orig_name)
+        enh_path=os.path.join(self._session_dir,enh_name)
+        orig_path=os.path.join(self._session_dir,orig_name)
+        if page.get("_cache_ok"):
+            srcs=page.get("_cache_src") or (None,None)
+            if all(src and os.path.isfile(src) for src in srcs):
+                if not all(self._copy_session_file(src,dst) for src,dst in zip(srcs,(enh_path,orig_path))):
+                    return None
+                page["_cache_files"]=names; page["_cache_src"]=(enh_path,orig_path)
+                return names
+            if tuple(page.get("_cache_files") or ())==names and os.path.isfile(enh_path) and os.path.isfile(orig_path):
+                page["_cache_src"]=(enh_path,orig_path); return names
+        try:
+            self._save_session_image(img,enh_path,"PNG",optimize=True)
+            self._save_session_image(orig.convert("RGB"),orig_path,"JPEG",quality=90,optimize=True)
+            page["_cache_ok"]=True; page["_cache_files"]=names; page["_cache_src"]=(enh_path,orig_path)
+            return names
+        except Exception:
+            traceback.print_exc()
+            page["_cache_ok"]=False
+            return None
 
     def _save_session(self):
         """يحفظ الجلسة الحالية دون الكتابة فوق أي ملف مصدر أثناء نسخه. يرجع True عند النجاح."""
@@ -2056,11 +2117,20 @@ class App(tk.Tk):
                         self._remove_temp_file(src)
             for page in self.pages:
                 if not page.get("processing"):self._discard_page_temp(page)
-            entries=[{"file":os.path.basename(stable),"path":stable,"rot":page.get("rot",0),
-                      "manual_angle":page.get("manual_angle",0),"crop_norm":page.get("crop_norm"),
-                      "dpi":page.get("dpi",300),"settings":page.get("settings") or self._settings()}
-                     for page,_src,stable in plans]
-            used=[os.path.basename(stable) for _page,_src,stable in plans]
+            entries=[]; used=[]
+            for n,(page,_src,stable) in enumerate(plans,1):
+                cache=None
+                if not page.get("processing"):
+                    cache=self._ensure_page_cache(page,f"enh_{n:03d}.png",f"origprev_{n:03d}.jpg")
+                enh_name,orig_name=cache if cache else (None,None)
+                entries.append({"file":os.path.basename(stable),"path":stable,"rot":page.get("rot",0),
+                                "manual_angle":page.get("manual_angle",0),"crop_norm":page.get("crop_norm"),
+                                "dpi":page.get("dpi",300),"settings":page.get("settings") or self._settings(),
+                                "enh":enh_name,"orig_preview":orig_name,"mode":page.get("mode"),
+                                "auto_angle":page.get("auto_angle",0),"note":page.get("note","")})
+                used.append(os.path.basename(stable))
+                if enh_name:used.append(enh_name)
+                if orig_name:used.append(orig_name)
             cur_page=self.pages[self.current] if 0<=self.current<len(self.pages) else None
             current=0
             for n,(page,_s,_st) in enumerate(plans):
@@ -2113,7 +2183,7 @@ class App(tk.Tk):
         try:
             os.makedirs(dest,exist_ok=True)
             for n in os.listdir(self._session_dir):
-                if n.startswith("page_"):
+                if n.startswith(("page_","enh_","origprev_")):
                     shutil.copy2(os.path.join(self._session_dir,n),os.path.join(dest,n))
             shutil.copy2(cur_json,os.path.join(dest,"session.json"))
         except Exception:
@@ -2264,8 +2334,10 @@ class App(tk.Tk):
         """
         try:
             if getattr(self,"_restoring",False) or not used:return
+            keep=set(used)
             for name in os.listdir(self._session_dir):
-                stale=(name.startswith("page_") and name not in used) or name.startswith(".tmp_")
+                stale=((name.startswith(("page_","enh_","origprev_")) and name not in keep)
+                       or name.startswith(".tmp_"))
                 if stale:
                     try:os.remove(os.path.join(self._session_dir,name))
                     except Exception:pass
@@ -2456,22 +2528,43 @@ class App(tk.Tk):
         except Exception:cur_src=0
         defaults=self._settings()
         self._restoring=True
-        self._set_busy(True,"جارٍ فتح الجلسة… (تظهر الصفحات فورًا ثم يكتمل تحسينها)")
+        self._set_busy(True,"جارٍ فتح الجلسة…")
         def worker():
-            # المرحلة 1 (سريعة): قراءة الصور فقط لعرضها فورًا. التحسين الثقيل يأتي بعدها في الخلفية.
+            # الجلسات الحديثة تحمل نتيجة الفلتر جاهزة، فلا نعيد المعالجة إلا للصفحات القديمة.
             pairs=[]
             try:
                 for idx,item in items:
-                    try:
-                        with Image.open(item["path"]) as source:
-                            im=ImageOps.exif_transpose(source).convert("RGB")
-                    except Exception:
-                        traceback.print_exc(); continue
-                    preview=im.copy(); preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
-                    page={"path":item["path"],"rot":item.get("rot",0),"manual_angle":item.get("manual_angle",0),
-                          "crop_norm":item.get("crop_norm"),"img":im,"preview":preview,"orig_preview":preview.copy(),
-                          "dpi":item.get("dpi",300),"processing":True,
-                          "settings":item.get("settings") or dict(defaults),"source_label":"restored"}
+                    cache_enh=self._resolve_session_file(item,"enh",base)
+                    cache_orig=self._resolve_session_file(item,"orig_preview",base)
+                    page=None
+                    if cache_enh and cache_orig:
+                        try:
+                            with Image.open(cache_enh) as source:
+                                im=source.copy()
+                            with Image.open(cache_orig) as source:
+                                original=ImageOps.exif_transpose(source).convert("RGB")
+                            preview=im.copy(); preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
+                            page={"path":item["path"],"rot":item.get("rot",0),"manual_angle":item.get("manual_angle",0),
+                                  "crop_norm":item.get("crop_norm"),"img":im,"preview":preview,
+                                  "orig_preview":original,"dpi":item.get("dpi",300),"processing":False,
+                                  "settings":item.get("settings") or dict(defaults),"mode":item.get("mode"),
+                                  "auto_angle":item.get("auto_angle",0),"note":item.get("note") or "",
+                                  "source_label":"restored","_cache_ok":True,
+                                  "_cache_files":(os.path.basename(cache_enh),os.path.basename(cache_orig)),
+                                  "_cache_src":(cache_enh,cache_orig)}
+                        except Exception:
+                            traceback.print_exc(); page=None
+                    if page is None:
+                        try:
+                            with Image.open(item["path"]) as source:
+                                im=ImageOps.exif_transpose(source).convert("RGB")
+                        except Exception:
+                            traceback.print_exc(); continue
+                        preview=im.copy(); preview.thumbnail((2200,2200),Image.Resampling.LANCZOS)
+                        page={"path":item["path"],"rot":item.get("rot",0),"manual_angle":item.get("manual_angle",0),
+                              "crop_norm":item.get("crop_norm"),"img":im,"preview":preview,"orig_preview":preview.copy(),
+                              "dpi":item.get("dpi",300),"processing":True,
+                              "settings":item.get("settings") or dict(defaults),"source_label":"restored"}
                     pairs.append((idx,page))
                 cur=0
                 for n,(i,_p) in enumerate(pairs):
@@ -2505,7 +2598,8 @@ class App(tk.Tk):
             self.pages=pages
             self.current=min(max(0,int(current)),max(0,len(pages)-1))
         first=self.pages[self.current]
-        self.show_original=True                       # تظهر النسخة الأصلية فورًا حتى ينتهي التحسين
+        pending=[page for page in pages if page.get("processing")]
+        self.show_original=bool(first.get("processing"))   # لا تظهر الأصل إن كانت النتيجة المحسّنة محفوظة
         self.show_page(); self._refresh_thumbnails()
         ok=self._save_session()
         if consume_dir and ok:
@@ -2513,7 +2607,13 @@ class App(tk.Tk):
             root=os.path.normcase(os.path.abspath(consume_dir))+os.sep
             if all(not os.path.normcase(os.path.abspath(p.get("path",""))).startswith(root) for p in pages):
                 self._remove_archive_dir(consume_dir)
-        self._enhance_restored(pages,first,"تم فتح الجلسة المحفوظة." if consume_dir else "تمت استعادة جلسة العمل السابقة.")
+        done_msg="تم فتح الجلسة المحفوظة." if consume_dir else "تمت استعادة جلسة العمل السابقة."
+        if pending:
+            self._enhance_restored(pending,first,done_msg)
+        else:
+            self._set_busy(False)
+            self._schedule_estimate()
+            self.status.set(done_msg)
 
     def _enhance_restored(self,pages,first,done_msg):
         """المرحلة 2: تحسين الصفحات المستعادة في الخلفية (الصفحة المعروضة أولًا) مع تحديث الواجهة بعد كل صفحة."""
@@ -2537,9 +2637,11 @@ class App(tk.Tk):
         if self.pages and self.pages[self.current] is page:
             self.show_original=False; self.show_page()
         self._refresh_thumbnails()
+        # حفظ نتيجة كل صفحة فورًا حتى لا يُعاد تحسينها إن أُغلق البرنامج قبل اكتمال الباقي.
+        self._save_session()
         if n>=total:
             self._set_busy(False)
-            self._schedule_estimate(); self._save_session()
+            self._schedule_estimate()
             self.status.set(done_msg)
         else:
             self.status.set(f"جارٍ تحسين الصفحات المستعادة ({n}/{total})…")
